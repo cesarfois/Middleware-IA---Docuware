@@ -1,0 +1,38 @@
+services:
+  docuware-ai-gateway:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: docuware-ai-gateway
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      - NODE_ENV=${NODE_ENV:-production}
+      - PORT=${PORT:-3000}
+      - HOST=0.0.0.0
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - OPENAI_MODEL=${OPENAI_MODEL:-gpt-4o}
+      - OPENAI_TIMEOUT_MS=${OPENAI_TIMEOUT_MS:-45000}
+      - OPENAI_MAX_RETRIES=${OPENAI_MAX_RETRIES:-2}
+      - API_AUTH_TOKEN=${API_AUTH_TOKEN}
+      - MAX_FILE_SIZE=${MAX_FILE_SIZE:-31457280}
+    expose:
+      - "${PORT:-3000}"
+    ports:
+      - "${PORT:-3000}:${PORT:-3000}"
+    mem_limit: 1g
+    cpus: 1.5
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /tmp:size=64M,mode=1777
+    networks:
+      - default
+
+networks:
+  default:
+    external: true
+    name: reverse-proxy-network
+

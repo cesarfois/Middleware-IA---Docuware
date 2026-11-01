@@ -1,0 +1,27 @@
+{
+  "name": "docuware-ai-gateway",
+  "version": "1.0.0",
+  "description": "Gateway Universal de Inteligência Documental (DocuWare Cloud 7.14 <-> OpenAI GPT-4o)",
+  "main": "dist/server.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/server.js",
+    "dev": "tsx watch src/server.ts",
+    "test": "node --test dist/tests/*.test.js"
+  },
+  "dependencies": {
+    "@fastify/multipart": "^9.0.3",
+    "dotenv": "^16.4.7",
+    "fastify": "^5.2.1",
+    "openai": "^4.86.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.13.5",
+    "tsx": "^4.19.3",
+    "typescript": "^5.7.3"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}
+
