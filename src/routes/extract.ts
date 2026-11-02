@@ -56,12 +56,12 @@ function tryParseJsonValue(val: string): unknown {
 /**
  * Resolve o JSON de configuração a partir dos campos multipart recebidos do DocuWare.
  * Suporta:
- * 1. Campo `requestData` contendo o JSON completo (padrão HTTP Body do DocuWare).
+ * 1. Campo `requestData` contendo o JSON completo (seja enviado como field ou como part application/json).
  * 2. Qualquer campo único cujo valor seja o JSON completo do contrato.
  * 3. Chaves do contrato (`instructions`, `extraction`, `prompt`, `schema`, etc.) enviadas
  *    individualmente como campos de formulário multipart no DocuWare.
  */
-function resolveRequestDataFromMultipartFields(
+export function resolveRequestDataFromMultipartFields(
   fields: Record<string, string>
 ): string | null {
   const fieldEntries = Object.entries(fields);
@@ -145,6 +145,7 @@ async function handleDocumentExtraction(
 
   let pdfBuffer: Buffer | null = null;
   let pdfFilename = 'document.pdf';
+  let nonPdfFileBuffer: Buffer | null = null;
   let fileTruncated = false;
   const receivedFields: Record<string, string> = {};
   const receivedPartSummary: string[] = [];
@@ -162,27 +163,35 @@ async function handleDocumentExtraction(
           fileTruncated = true;
         }
         const buf = Buffer.concat(chunks);
+        const fieldNameLower = (part.fieldname || '').toLowerCase();
+        const mimeLower = (part.mimetype || '').toLowerCase();
+
         receivedPartSummary.push(
           `file:${part.fieldname}(${part.mimetype},${buf.byteLength}b)`
         );
 
-        // Verifica se este arquivo é o PDF ou se é um part JSON enviado como arquivo pelo cliente HTTP
-        if (isValidPdfBuffer(buf) || part.fieldname === 'file' || pdfBuffer === null) {
-          if (isValidPdfBuffer(buf) || pdfBuffer === null) {
-            pdfBuffer = buf;
-            if (part.filename) {
-              pdfFilename = part.filename;
-            }
-          } else {
-            const textContent = buf.toString('utf8').trim();
-            if (textContent.startsWith('{')) {
-              receivedFields[part.fieldname || 'requestData'] = textContent;
-            }
+        // O DocuWare Cloud envia `requestData` com Content-Type: application/json,
+        // o que faz o parser multipart classificá-lo como `part.type === 'file'`.
+        if (
+          fieldNameLower === 'requestdata' ||
+          mimeLower.includes('json') ||
+          mimeLower.startsWith('text/')
+        ) {
+          receivedFields[part.fieldname || 'requestData'] = buf
+            .toString('utf8')
+            .trim();
+        } else if (isValidPdfBuffer(buf) || mimeLower === 'application/pdf') {
+          pdfBuffer = buf;
+          if (part.filename) {
+            pdfFilename = part.filename;
           }
         } else {
-          const textContent = buf.toString('utf8').trim();
-          if (textContent.startsWith('{')) {
-            receivedFields[part.fieldname || 'requestData'] = textContent;
+          // Caso seja um arquivo sem assinatura %PDF- e não-JSON, guarda para diagnóstico de INVALID_PDF
+          const asText = buf.toString('utf8').trim();
+          if (asText.startsWith('{') && asText.endsWith('}')) {
+            receivedFields[part.fieldname || 'requestData'] = asText;
+          } else {
+            nonPdfFileBuffer = buf;
           }
         }
       } else {
@@ -226,6 +235,16 @@ async function handleDocumentExtraction(
       error: true,
       code: 'FILE_TOO_LARGE',
       message: `O arquivo PDF excede o tamanho máximo permitido de ${maxMb} MB.`,
+    };
+    return reply.status(422).send(payload);
+  }
+
+  if (!pdfBuffer && nonPdfFileBuffer) {
+    const payload: StandardErrorResponse = {
+      error: true,
+      code: 'INVALID_PDF',
+      message:
+        'O arquivo enviado no campo "file" não possui assinatura binária de um PDF válido (%PDF-).',
     };
     return reply.status(422).send(payload);
   }
