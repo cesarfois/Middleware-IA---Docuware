@@ -10,7 +10,8 @@ Com esta arquitetura orientada a metadados, você mantém **um único serviço n
 
 | Tipo de Acesso | Endpoint de Extração (`POST`) | Healthcheck (`GET`) |
 | :--- | :--- | :--- |
-| **Domínio (`portal_nginx`)** | `http://wp.processcloud.app/ai-gateway/extract` | `http://wp.processcloud.app/ai-gateway/health` |
+| **HTTPS Principal (`portal_nginx`)** | `https://wp.processcloud.app/ai-gateway/extract` | `https://wp.processcloud.app/ai-gateway/health` |
+| **HTTP Domínio (`portal_nginx`)** | `http://wp.processcloud.app/ai-gateway/extract` | `http://wp.processcloud.app/ai-gateway/health` |
 | **IP Direto (Porta `3014`)** | `http://13.140.173.35:3014/extract` | `http://13.140.173.35:3014/health` |
 
 * **Diretório na VPS:** `/app/middleware-ia-docuware`
@@ -65,7 +66,7 @@ Com esta arquitetura orientada a metadados, você mantém **um único serviço n
 Em **DocuWare Configurações (Configurations)** ➔ **Web Services**:
 1. Crie um novo serviço **REST**:
    * **Nome:** `Gateway Universal IA`
-   * **URL Raiz:** `http://wp.processcloud.app/ai-gateway` *(ou `http://13.140.173.35:3014`)*
+   * **URL Raiz:** `https://wp.processcloud.app/ai-gateway`
 2. Em **Cabeçalhos Padrão (Default Headers)**, adicione:
    * **Nome:** `X-DocuWare-Token`
    * **Valor:** `docuware_token_2026` *(valor definido em `API_AUTH_TOKEN` no `.env` da VPS)*
@@ -200,14 +201,14 @@ Basta copiar e colar no campo **HTTP Body** da atividade do DocuWare Workflow De
 
 ## 6. Testes via `curl`
 
-### Verificar Healthcheck
+### Verificar Healthcheck (HTTPS)
 ```bash
-curl http://wp.processcloud.app/ai-gateway/health
+curl https://wp.processcloud.app/ai-gateway/health
 ```
 
 ### Enviar PDF + Instruções Dinâmicas (`requestData`)
 ```bash
-curl -X POST "http://wp.processcloud.app/ai-gateway/extract" \
+curl -X POST "https://wp.processcloud.app/ai-gateway/extract" \
   -H "X-DocuWare-Token: docuware_token_2026" \
   -F "file=@./contrato.pdf;type=application/pdf" \
   -F 'requestData={
