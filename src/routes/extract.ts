@@ -28,6 +28,105 @@ export function isValidPdfBuffer(buffer: Buffer): boolean {
   return headerSlice.includes('%PDF-');
 }
 
+/**
+ * Tenta fazer o parse de uma string JSON caso ela represente um objeto ou array.
+ */
+function tryParseJsonValue(val: string): unknown {
+  const trimmed = val.trim();
+  if (
+    (trimmed.startsWith('{') && trimmed.endsWith('}')) ||
+    (trimmed.startsWith('[') && trimmed.endsWith(']'))
+  ) {
+    try {
+      return JSON.parse(trimmed);
+    } catch {
+      try {
+        const sanitized = trimmed
+          .replace(/[\u201C\u201D]/g, '"')
+          .replace(/,\s*([}\]])/g, '$1');
+        return JSON.parse(sanitized);
+      } catch {
+        return val;
+      }
+    }
+  }
+  return val;
+}
+
+/**
+ * Resolve o JSON de configuração a partir dos campos multipart recebidos do DocuWare.
+ * Suporta:
+ * 1. Campo `requestData` contendo o JSON completo (padrão HTTP Body do DocuWare).
+ * 2. Qualquer campo único cujo valor seja o JSON completo do contrato.
+ * 3. Chaves do contrato (`instructions`, `extraction`, `prompt`, `schema`, etc.) enviadas
+ *    individualmente como campos de formulário multipart no DocuWare.
+ */
+function resolveRequestDataFromMultipartFields(
+  fields: Record<string, string>
+): string | null {
+  const fieldEntries = Object.entries(fields);
+  if (fieldEntries.length === 0) {
+    return null;
+  }
+
+  // 1. Prioriza `requestData` (case-insensitive) se não estiver vazio
+  for (const [key, val] of fieldEntries) {
+    if (key.toLowerCase() === 'requestdata' && val.trim().length > 0) {
+      return val.trim();
+    }
+  }
+
+  // 2. Verifica se algum campo único contém um objeto JSON completo com instructions/extraction ou prompt/schema
+  for (const [, val] of fieldEntries) {
+    const trimmed = val.trim();
+    if (trimmed.startsWith('{') && trimmed.endsWith('}')) {
+      const parsed = tryParseJsonValue(trimmed);
+      if (
+        parsed &&
+        typeof parsed === 'object' &&
+        !Array.isArray(parsed) &&
+        ('instructions' in parsed ||
+          'extraction' in parsed ||
+          'prompt' in parsed ||
+          'schema' in parsed)
+      ) {
+        return JSON.stringify(parsed);
+      }
+    }
+  }
+
+  // 3. Caso o DocuWare tenha enviado as chaves do contrato como campos multipart separados
+  const contractRootKeys = new Set([
+    'provider',
+    'model',
+    'processing',
+    'instructions',
+    'extraction',
+    'response',
+    'system_instruction',
+    'prompt',
+    'schema',
+  ]);
+
+  const hasSeparateContractKeys = fieldEntries.some(([k]) =>
+    contractRootKeys.has(k)
+  );
+
+  if (hasSeparateContractKeys) {
+    const reconstructed: Record<string, unknown> = {};
+    for (const [key, val] of fieldEntries) {
+      if (contractRootKeys.has(key) && val.trim().length > 0) {
+        reconstructed[key] = tryParseJsonValue(val);
+      }
+    }
+    if (Object.keys(reconstructed).length > 0) {
+      return JSON.stringify(reconstructed);
+    }
+  }
+
+  return null;
+}
+
 async function handleDocumentExtraction(
   request: FastifyRequest,
   reply: FastifyReply
@@ -47,39 +146,54 @@ async function handleDocumentExtraction(
   let pdfBuffer: Buffer | null = null;
   let pdfFilename = 'document.pdf';
   let fileTruncated = false;
-  let rawRequestData: string | null = null;
+  const receivedFields: Record<string, string> = {};
+  const receivedPartSummary: string[] = [];
 
   try {
     const parts = request.parts();
 
     for await (const part of parts) {
       if (part.type === 'file') {
-        if (part.fieldname === 'file' || pdfBuffer === null) {
-          const chunks: Buffer[] = [];
-          for await (const chunk of part.file) {
-            chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
-          }
-          if (part.file.truncated) {
-            fileTruncated = true;
-          }
-          pdfBuffer = Buffer.concat(chunks);
-          if (part.filename) {
-            pdfFilename = part.filename;
+        const chunks: Buffer[] = [];
+        for await (const chunk of part.file) {
+          chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+        }
+        if (part.file.truncated) {
+          fileTruncated = true;
+        }
+        const buf = Buffer.concat(chunks);
+        receivedPartSummary.push(
+          `file:${part.fieldname}(${part.mimetype},${buf.byteLength}b)`
+        );
+
+        // Verifica se este arquivo é o PDF ou se é um part JSON enviado como arquivo pelo cliente HTTP
+        if (isValidPdfBuffer(buf) || part.fieldname === 'file' || pdfBuffer === null) {
+          if (isValidPdfBuffer(buf) || pdfBuffer === null) {
+            pdfBuffer = buf;
+            if (part.filename) {
+              pdfFilename = part.filename;
+            }
+          } else {
+            const textContent = buf.toString('utf8').trim();
+            if (textContent.startsWith('{')) {
+              receivedFields[part.fieldname || 'requestData'] = textContent;
+            }
           }
         } else {
-          part.file.resume();
+          const textContent = buf.toString('utf8').trim();
+          if (textContent.startsWith('{')) {
+            receivedFields[part.fieldname || 'requestData'] = textContent;
+          }
         }
       } else {
-        const fieldNameLower = part.fieldname.toLowerCase();
-        if (
-          part.fieldname === 'requestData' ||
-          fieldNameLower === 'requestdata'
-        ) {
-          rawRequestData =
-            typeof part.value === 'string'
-              ? part.value
-              : String(part.value ?? '');
-        }
+        const strVal =
+          typeof part.value === 'string'
+            ? part.value
+            : String(part.value ?? '');
+        receivedFields[part.fieldname] = strVal;
+        receivedPartSummary.push(
+          `field:${part.fieldname}(${strVal.trim().length}chars)`
+        );
       }
     }
   } catch (err) {
@@ -135,6 +249,8 @@ async function handleDocumentExtraction(
     return reply.status(422).send(payload);
   }
 
+  const rawRequestData = resolveRequestDataFromMultipartFields(receivedFields);
+
   // Valida estritamente o JSON requestData (sem fallback silencioso)
   let extractionRequest: NormalizedExtractionRequest;
   try {
@@ -142,20 +258,29 @@ async function handleDocumentExtraction(
   } catch (err) {
     const statusCode =
       err instanceof RequestValidationError ? err.statusCode : 422;
-    const message =
+    const baseMessage =
       err instanceof Error
         ? err.message
         : 'Configuração inválida no campo requestData.';
+    const diagnosticSuffix =
+      receivedPartSummary.length > 0
+        ? ` [Partes multipart recebidas: ${receivedPartSummary.join(', ')}]`
+        : '';
 
     request.log.warn(
-      { status: 'INVALID_CONFIGURATION', httpStatus: statusCode, message },
+      {
+        status: 'INVALID_CONFIGURATION',
+        httpStatus: statusCode,
+        receivedParts: receivedPartSummary,
+        message: baseMessage,
+      },
       'Requisição rejeitada por configuração inválida em requestData.'
     );
 
     const payload: StandardErrorResponse = {
       error: true,
       code: 'INVALID_CONFIGURATION',
-      message,
+      message: `${baseMessage}${diagnosticSuffix}`,
     };
     return reply.status(statusCode).send(payload);
   }
