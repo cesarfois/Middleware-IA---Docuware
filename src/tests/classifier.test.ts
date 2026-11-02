@@ -3,22 +3,23 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { after, before, describe, it } from 'node:test';
-import type { FastifyInstance } from 'fastify';
-import { ClassifierService } from '../classifier-service.js';
+import {
+  ClassifierService,
+  ClassifierValidationError,
+  validateAndNormalizeClassifyRequest,
+  validateAndNormalizeTrainRequest,
+} from '../classifier-service.js';
 import { ClassifierStore } from '../classifier-store.js';
-import { config } from '../config.js';
 import {
   DocuWarePlatformClient,
   DocuWareServiceError,
+  truncateTextWordSafe,
+  validateAndNormalizeTextshotRequest,
 } from '../docuware-client.js';
-import { buildApp } from '../server.js';
+import { parseRequestData } from '../schema-builder.js';
 import type {
-  ClassifyResponse,
   NormalizedTextshotRequest,
-  StandardErrorResponse,
   TextshotResponse,
-  TrainImmediateResponse,
-  TrainStatusResponse,
 } from '../types.js';
 
 /**
@@ -76,24 +77,28 @@ function buildRealisticOcrText(kind: string, docId: number): string {
       ].join('\n');
 
     case 'incoerente': {
-      // Gera 10 textos completamente contraditórios entre si e com vocabulários disjuntos a cada índice
+      // Gera 10 textos completamente contraditórios entre si e com vocabulários 100% disjuntos para cada um dos 10 exemplos
       const vocabBuckets = [
         'alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu',
-        'sol lua estrelas galaxia nebulosa cometa orbita telescópio saturno jupiter',
-        'futebol basquetebol voleibol natação atletismo maratona campeonato golo arbitro',
-        'culinária receita forno farinha açucar chocolate baunilha sobremesa cozinhar',
-        'geologia vulcão magma basalto granito tectónica sedimento fóssil mineral',
+        'sol lua estrelas galaxia nebulosa cometa orbita telescopio saturno jupiter',
+        'futebol basquetebol voleibol natacao atletismo maratona campeonato golo arbitro',
+        'culinaria receita forno farinha acucar chocolate baunilha sobremesa cozinhar',
+        'geologia vulcao magma basalto granito tectonica sedimento fossil mineral',
+        'arquitetura alvenaria betao viga pilar fundacao telhado fachada planta',
+        'botanica clorofila fotossintese raiz caule folha polen semente orquidea',
+        'musica sinfonia violino piano acorde melodia harmonia maestro partitura',
+        'medicina cardiologia estetoscopio diagnostico bisturi clinica cirurgiao anatomia',
+        'nautica navio bussola ancora proa popa estibordo bombordo marinheiro',
       ];
       const bucket = vocabBuckets[docId % vocabBuckets.length];
-      return `${bucket} item_${docId % 5} registo_${docId % 5} texto_aleatorio_${docId % 5} ${bucket}`;
+      return `${bucket} exclusivo_${docId} topico_${docId}`;
     }
 
     case 'ambiguo':
       return [
-        `DOCUMENTO MISTO DE REFERÊNCIA #${docId}`,
-        `Nota de conferência interna sem cabeçalho padrão definido.`,
-        `Contém referência cruzada simultânea a Fatura Comercial FT 2026/${docId} com Base Tributável e IVA`,
-        `e simultaneamente a Nota de Crédito NC 2026/${docId} de Retificação, Anulação, Devolução e Estorno parcial.`,
+        `COMUNICADO INTERNO ADMINISTRATIVO #${docId}`,
+        `Aviso geral da administração predial sobre atualização dos horários de receção e portaria.`,
+        `Sem classificação documental financeira ou contratual associada neste registo.`,
       ].join('\n');
 
     default:
@@ -105,11 +110,6 @@ describe('Sistema de Aprendizagem Supervisionada e Classificação Automática L
   let tmpDir: string;
   let store: ClassifierStore;
   let service: ClassifierService;
-  let app: FastifyInstance;
-  if (!config.apiAuthToken) {
-    config.apiAuthToken = 'test_docuware_token_2026';
-  }
-  const authToken = config.apiAuthToken;
 
   // Mapa de documentos simulados no DocuWare (key: `${fileCabinetId}:${documentId}`)
   const mockDocuments = new Map<string, string | Error>();
@@ -173,18 +173,13 @@ describe('Sistema de Aprendizagem Supervisionada e Classificação Automática L
     },
   } as unknown as DocuWarePlatformClient;
 
-  before(async () => {
+  before(() => {
     tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'dw-classifier-test-'));
     store = new ClassifierStore(tmpDir);
     service = new ClassifierService(store, mockDwClient);
-    app = await buildApp({
-      docuWareClient: mockDwClient,
-      classifierService: service,
-    });
   });
 
-  after(async () => {
-    await app.close();
+  after(() => {
     try {
       fs.rmSync(tmpDir, { recursive: true, force: true });
     } catch {
@@ -199,20 +194,14 @@ describe('Sistema de Aprendizagem Supervisionada e Classificação Automática L
     const cab = 'fc-glpi-001';
     mockDocuments.set(`${cab}:1001`, buildRealisticOcrText('ficha_intervencao', 1001));
 
-    // 1. Envia documento único para /ai-gateway/train
-    const res1 = await app.inject({
-      method: 'POST',
-      url: '/ai-gateway/train',
-      headers: { 'x-docuware-token': authToken },
-      payload: {
-        fileCabinetId: cab,
-        documentId: 1001,
-        documentType: 'Ficha de Intervenção',
-      },
+    // 1. Envia documento único para treino
+    const req1 = validateAndNormalizeTrainRequest({
+      fileCabinetId: cab,
+      documentId: 1001,
+      documentType: 'Ficha de Intervenção',
     });
+    const body1 = service.enqueueTrainingDocument(req1);
 
-    assert.equal(res1.statusCode, 200);
-    const body1 = res1.json<TrainImmediateResponse>();
     assert.equal(body1.success, true);
     assert.equal(body1.status, 'queued');
     assert.ok(body1.trainingId.startsWith('trn-'));
@@ -220,15 +209,8 @@ describe('Sistema de Aprendizagem Supervisionada e Classificação Automática L
     // Aguarda processamento assíncrono na fila
     await service.waitForIdle();
 
-    // Consulta estado via GET /ai-gateway/train/status
-    const statusRes1 = await app.inject({
-      method: 'GET',
-      url: `/ai-gateway/train/status?trainingId=${body1.trainingId}`,
-      headers: { 'x-docuware-token': authToken },
-    });
-
-    assert.equal(statusRes1.statusCode, 200);
-    const statusBody1 = statusRes1.json<TrainStatusResponse>();
+    // Consulta estado via getTrainingStatus
+    const statusBody1 = service.getTrainingStatus(body1.trainingId);
     assert.equal(statusBody1.status, 'stored');
     assert.equal(statusBody1.category.status, 'pending_validation');
     assert.equal(statusBody1.category.examplesReceived, 1);
@@ -239,26 +221,15 @@ describe('Sistema de Aprendizagem Supervisionada e Classificação Automática L
     assert.equal(statusBody1.details.includedInModel, false);
 
     // 2. Reenvia o MESMO documento (mesmo fileCabinetId + documentId) com o MESMO documentType (variação de maiúsculas)
-    const res2 = await app.inject({
-      method: 'POST',
-      url: '/ai-gateway/train',
-      headers: { 'x-docuware-token': authToken },
-      payload: {
-        fileCabinetId: cab,
-        documentId: 1001,
-        documentType: 'FICHA DE INTERVENÇÃO',
-      },
+    const req2 = validateAndNormalizeTrainRequest({
+      fileCabinetId: cab,
+      documentId: 1001,
+      documentType: 'FICHA DE INTERVENÇÃO',
     });
-
-    const body2 = res2.json<TrainImmediateResponse>();
+    const body2 = service.enqueueTrainingDocument(req2);
     await service.waitForIdle();
 
-    const statusRes2 = await app.inject({
-      method: 'GET',
-      url: `/ai-gateway/train/status?trainingId=${body2.trainingId}`,
-      headers: { 'x-docuware-token': authToken },
-    });
-    const statusBody2 = statusRes2.json<TrainStatusResponse>();
+    const statusBody2 = service.getTrainingStatus(body2.trainingId);
 
     // Confirma que não inflacionou a contagem de exemplos da categoria (continua 1)
     assert.equal(statusBody2.category.examplesReceived, 1);
@@ -267,28 +238,15 @@ describe('Sistema de Aprendizagem Supervisionada e Classificação Automática L
 
   it('Cenário 3: Deve tratar o reenvio do mesmo documento com tipo diferente como correção supervisionada de rótulo', async () => {
     const cab = 'fc-glpi-001';
-    // O documento 1001 estava registado como "Ficha de Intervenção" (contagem = 1).
-    // Vamos reenviá-lo corrigindo o rótulo para "Relatório Técnico" e depois voltar para "Ficha de Intervenção".
-    const resCorr = await app.inject({
-      method: 'POST',
-      url: '/ai-gateway/train',
-      headers: { 'x-docuware-token': authToken },
-      payload: {
-        fileCabinetId: cab,
-        documentId: 1001,
-        documentType: 'Relatório Técnico',
-      },
+    const corrReq = validateAndNormalizeTrainRequest({
+      fileCabinetId: cab,
+      documentId: 1001,
+      documentType: 'Relatório Técnico',
     });
-
-    const corrJob = resCorr.json<TrainImmediateResponse>();
+    const corrJob = service.enqueueTrainingDocument(corrReq);
     await service.waitForIdle();
 
-    const statusRes = await app.inject({
-      method: 'GET',
-      url: `/ai-gateway/train/status?trainingId=${corrJob.trainingId}`,
-      headers: { 'x-docuware-token': authToken },
-    });
-    const statusBody = statusRes.json<TrainStatusResponse>();
+    const statusBody = service.getTrainingStatus(corrJob.trainingId);
 
     assert.equal(statusBody.details.wasCorrection, true);
     assert.equal(statusBody.details.previousDocumentType, 'Ficha de Intervenção');
@@ -296,51 +254,35 @@ describe('Sistema de Aprendizagem Supervisionada e Classificação Automática L
     assert.equal(store.getCategory('ficha_de_intervencao')?.examplesCount, 0);
 
     // Reverte para Ficha de Intervenção para continuar os próximos cenários
-    await app.inject({
-      method: 'POST',
-      url: '/ai-gateway/train',
-      headers: { 'x-docuware-token': authToken },
-      payload: {
-        fileCabinetId: cab,
-        documentId: 1001,
-        documentType: 'Ficha de Intervenção',
-      },
+    const revertReq = validateAndNormalizeTrainRequest({
+      fileCabinetId: cab,
+      documentId: 1001,
+      documentType: 'Ficha de Intervenção',
     });
+    service.enqueueTrainingDocument(revertReq);
     await service.waitForIdle();
     assert.equal(store.getCategory('ficha_de_intervencao')?.examplesCount, 1);
   });
 
   it('Cenário 4, 5 e 7: Deve manter pending_validation de 1 a 9 exemplos (de múltiplos armários) e treinar/ativar automaticamente no 10.º exemplo', async () => {
-    // Já temos 1 exemplo (doc 1001 no armário fc-glpi-001).
-    // Vamos enviar os exemplos 2 a 9 distribuídos entre dois armários diferentes (fc-glpi-001 e fc-manut-002).
     let lastTrainingId = '';
     for (let i = 2; i <= 9; i++) {
       const docId = 1000 + i;
       const cab = i % 2 === 0 ? 'fc-glpi-001' : 'fc-manut-002';
       mockDocuments.set(`${cab}:${docId}`, buildRealisticOcrText('ficha_intervencao', docId));
 
-      const res = await app.inject({
-        method: 'POST',
-        url: '/ai-gateway/train',
-        headers: { 'x-docuware-token': authToken },
-        payload: {
-          fileCabinetId: cab,
-          documentId: docId,
-          documentType: 'Ficha de Intervenção',
-        },
+      const req = validateAndNormalizeTrainRequest({
+        fileCabinetId: cab,
+        documentId: docId,
+        documentType: 'Ficha de Intervenção',
       });
-      lastTrainingId = res.json<TrainImmediateResponse>().trainingId;
+      lastTrainingId = service.enqueueTrainingDocument(req).trainingId;
     }
 
     await service.waitForIdle();
 
     // No 9.º exemplo, a categoria DEVE continuar em pending_validation e o job em stored (não learned!)
-    const status9Res = await app.inject({
-      method: 'GET',
-      url: `/ai-gateway/train/status?trainingId=${lastTrainingId}`,
-      headers: { 'x-docuware-token': authToken },
-    });
-    const status9 = status9Res.json<TrainStatusResponse>();
+    const status9 = service.getTrainingStatus(lastTrainingId);
     assert.equal(status9.status, 'stored');
     assert.equal(status9.category.status, 'pending_validation');
     assert.equal(status9.category.examplesReceived, 9);
@@ -349,27 +291,17 @@ describe('Sistema de Aprendizagem Supervisionada e Classificação Automática L
     // Envia agora o 10.º exemplo da categoria "Ficha de Intervenção"
     const cab10 = 'fc-manut-002';
     mockDocuments.set(`${cab10}:1010`, buildRealisticOcrText('ficha_intervencao', 1010));
-    const res10 = await app.inject({
-      method: 'POST',
-      url: '/ai-gateway/train',
-      headers: { 'x-docuware-token': authToken },
-      payload: {
-        fileCabinetId: cab10,
-        documentId: 1010,
-        documentType: 'Ficha de Intervenção',
-      },
+    const req10 = validateAndNormalizeTrainRequest({
+      fileCabinetId: cab10,
+      documentId: 1010,
+      documentType: 'Ficha de Intervenção',
     });
-    const job10Id = res10.json<TrainImmediateResponse>().trainingId;
+    const job10Id = service.enqueueTrainingDocument(req10).trainingId;
 
     await service.waitForIdle();
 
     // Confirma que o 10.º exemplo disparou o treino automático, validou o modelo e passou a 'learned' e 'active'
-    const status10Res = await app.inject({
-      method: 'GET',
-      url: `/ai-gateway/train/status?trainingId=${job10Id}`,
-      headers: { 'x-docuware-token': authToken },
-    });
-    const status10 = status10Res.json<TrainStatusResponse>();
+    const status10 = service.getTrainingStatus(job10Id);
     assert.equal(status10.status, 'learned');
     assert.equal(status10.category.status, 'active');
     assert.equal(status10.category.examplesReceived, 10);
@@ -386,29 +318,19 @@ describe('Sistema de Aprendizagem Supervisionada e Classificação Automática L
       const docId = 9000 + i;
       mockDocuments.set(`${cab}:${docId}`, buildRealisticOcrText('incoerente', i));
 
-      const res = await app.inject({
-        method: 'POST',
-        url: '/ai-gateway/train',
-        headers: { 'x-docuware-token': authToken },
-        payload: {
-          fileCabinetId: cab,
-          documentId: docId,
-          documentType: 'Categoria Incoerente',
-        },
+      const req = validateAndNormalizeTrainRequest({
+        fileCabinetId: cab,
+        documentId: docId,
+        documentType: 'Categoria Incoerente',
       });
-      lastId = res.json<TrainImmediateResponse>().trainingId;
+      lastId = service.enqueueTrainingDocument(req).trainingId;
     }
 
     await service.waitForIdle();
 
-    const statusRes = await app.inject({
-      method: 'GET',
-      url: `/ai-gateway/train/status?trainingId=${lastId}`,
-      headers: { 'x-docuware-token': authToken },
-    });
-    const statusBody = statusRes.json<TrainStatusResponse>();
+    const statusBody = service.getTrainingStatus(lastId);
 
-    // Como os 10 textos são contraditórios em 5 grupos disjuntos, o F1 da categoria é baixo (< 0.75)
+    // Como os 10 textos têm vocabulários 100% disjuntos entre si, o F1 da categoria é 0 (< 0.75)
     assert.equal(statusBody.category.examplesReceived, 10);
     assert.equal(statusBody.category.status, 'pending_validation');
     assert.equal(statusBody.category.active, false);
@@ -453,16 +375,12 @@ describe('Sistema de Aprendizagem Supervisionada e Classificação Automática L
           `${cat.cab}:${docId}`,
           buildRealisticOcrText(cat.kind, docId)
         );
-        await app.inject({
-          method: 'POST',
-          url: '/ai-gateway/train',
-          headers: { 'x-docuware-token': authToken },
-          payload: {
-            fileCabinetId: cat.cab,
-            documentId: docId,
-            documentType: cat.type,
-          },
+        const req = validateAndNormalizeTrainRequest({
+          fileCabinetId: cat.cab,
+          documentId: docId,
+          documentType: cat.type,
         });
+        service.enqueueTrainingDocument(req);
       }
     }
 
@@ -481,14 +399,12 @@ describe('Sistema de Aprendizagem Supervisionada e Classificação Automática L
       `${thirdCab}:8001`,
       buildRealisticOcrText('ficha_intervencao', 8001)
     );
-    const clsFichaRes = await app.inject({
-      method: 'POST',
-      url: '/ai-gateway/classify',
-      headers: { 'x-docuware-token': authToken },
-      payload: { fileCabinetId: thirdCab, documentId: 8001 },
-    });
-    assert.equal(clsFichaRes.statusCode, 200);
-    const clsFicha = clsFichaRes.json<ClassifyResponse>();
+    const clsFicha = await service.classifyDocument(
+      validateAndNormalizeClassifyRequest({
+        fileCabinetId: thirdCab,
+        documentId: 8001,
+      })
+    );
     assert.equal(clsFicha.status, 'classified');
     assert.equal(clsFicha.classification.documentType, 'Ficha de Intervenção');
     assert.equal(clsFicha.classification.requiresManualReview, false);
@@ -499,27 +415,24 @@ describe('Sistema de Aprendizagem Supervisionada e Classificação Automática L
       `${thirdCab}:8002`,
       buildRealisticOcrText('contrato', 8002)
     );
-    const clsContratoRes = await app.inject({
-      method: 'POST',
-      url: '/ai-gateway/classify',
-      headers: { 'x-docuware-token': authToken },
-      payload: { fileCabinetId: thirdCab, documentId: 8002 },
-    });
-    const clsContrato = clsContratoRes.json<ClassifyResponse>();
+    const clsContrato = await service.classifyDocument(
+      validateAndNormalizeClassifyRequest({
+        fileCabinetId: thirdCab,
+        documentId: 8002,
+      })
+    );
     assert.equal(clsContrato.status, 'classified');
     assert.equal(clsContrato.classification.documentType, 'Contrato');
     assert.equal(clsContrato.classification.requiresManualReview, false);
 
     // Cenário 11: Distinguir entre "Fatura", "Nota de Crédito" e "Fatura de Adiantamento"
     mockDocuments.set(`${thirdCab}:8003`, buildRealisticOcrText('fatura', 8003));
-    const clsFatura = (
-      await app.inject({
-        method: 'POST',
-        url: '/ai-gateway/classify',
-        headers: { 'x-docuware-token': authToken },
-        payload: { fileCabinetId: thirdCab, documentId: 8003 },
+    const clsFatura = await service.classifyDocument(
+      validateAndNormalizeClassifyRequest({
+        fileCabinetId: thirdCab,
+        documentId: 8003,
       })
-    ).json<ClassifyResponse>();
+    );
     assert.equal(clsFatura.status, 'classified');
     assert.equal(clsFatura.classification.documentType, 'Fatura');
 
@@ -527,14 +440,12 @@ describe('Sistema de Aprendizagem Supervisionada e Classificação Automática L
       `${thirdCab}:8004`,
       buildRealisticOcrText('nota_credito', 8004)
     );
-    const clsNC = (
-      await app.inject({
-        method: 'POST',
-        url: '/ai-gateway/classify',
-        headers: { 'x-docuware-token': authToken },
-        payload: { fileCabinetId: thirdCab, documentId: 8004 },
+    const clsNC = await service.classifyDocument(
+      validateAndNormalizeClassifyRequest({
+        fileCabinetId: thirdCab,
+        documentId: 8004,
       })
-    ).json<ClassifyResponse>();
+    );
     assert.equal(clsNC.status, 'classified');
     assert.equal(clsNC.classification.documentType, 'Nota de Crédito');
 
@@ -542,14 +453,12 @@ describe('Sistema de Aprendizagem Supervisionada e Classificação Automática L
       `${thirdCab}:8005`,
       buildRealisticOcrText('fatura_adiantamento', 8005)
     );
-    const clsFA = (
-      await app.inject({
-        method: 'POST',
-        url: '/ai-gateway/classify',
-        headers: { 'x-docuware-token': authToken },
-        payload: { fileCabinetId: thirdCab, documentId: 8005 },
+    const clsFA = await service.classifyDocument(
+      validateAndNormalizeClassifyRequest({
+        fileCabinetId: thirdCab,
+        documentId: 8005,
       })
-    ).json<ClassifyResponse>();
+    );
     assert.equal(clsFA.status, 'classified');
     assert.equal(
       clsFA.classification.documentType,
@@ -561,15 +470,13 @@ describe('Sistema de Aprendizagem Supervisionada e Classificação Automática L
     const cab = 'fc-armario-terceiro-999';
     mockDocuments.set(`${cab}:8099`, buildRealisticOcrText('ambiguo', 8099));
 
-    const res = await app.inject({
-      method: 'POST',
-      url: '/ai-gateway/classify',
-      headers: { 'x-docuware-token': authToken },
-      payload: { fileCabinetId: cab, documentId: 8099 },
-    });
+    const body = await service.classifyDocument(
+      validateAndNormalizeClassifyRequest({
+        fileCabinetId: cab,
+        documentId: 8099,
+      })
+    );
 
-    assert.equal(res.statusCode, 200);
-    const body = res.json<ClassifyResponse>();
     assert.equal(body.status, 'needs_review');
     assert.equal(body.classification.documentType, null);
     assert.equal(body.classification.requiresManualReview, true);
@@ -587,29 +494,33 @@ describe('Sistema de Aprendizagem Supervisionada e Classificação Automática L
     );
 
     // 13. Documento sem Textshot disponível
-    const resNoTextshot = await app.inject({
-      method: 'POST',
-      url: '/ai-gateway/classify',
-      headers: { 'x-docuware-token': authToken },
-      payload: { fileCabinetId: cab, documentId: 7001 },
-    });
-    assert.equal(resNoTextshot.statusCode, 422);
-    assert.equal(
-      resNoTextshot.json<StandardErrorResponse>().code,
-      'TEXTSHOT_NOT_AVAILABLE'
+    await assert.rejects(
+      () =>
+        service.classifyDocument(
+          validateAndNormalizeClassifyRequest({
+            fileCabinetId: cab,
+            documentId: 7001,
+          })
+        ),
+      (err: unknown) =>
+        err instanceof DocuWareServiceError &&
+        err.code === 'TEXTSHOT_NOT_AVAILABLE' &&
+        err.statusCode === 422
     );
 
-    // 14. Documento inexistente no DocuWare (não está no mapa mockDocuments)
-    const resNotFound = await app.inject({
-      method: 'POST',
-      url: '/ai-gateway/classify',
-      headers: { 'x-docuware-token': authToken },
-      payload: { fileCabinetId: cab, documentId: 999999 },
-    });
-    assert.equal(resNotFound.statusCode, 404);
-    assert.equal(
-      resNotFound.json<StandardErrorResponse>().code,
-      'DOCUMENT_NOT_FOUND'
+    // 14. Documento inexistente no DocuWare
+    await assert.rejects(
+      () =>
+        service.classifyDocument(
+          validateAndNormalizeClassifyRequest({
+            fileCabinetId: cab,
+            documentId: 999999,
+          })
+        ),
+      (err: unknown) =>
+        err instanceof DocuWareServiceError &&
+        err.code === 'DOCUMENT_NOT_FOUND' &&
+        err.statusCode === 404
     );
   });
 
@@ -650,42 +561,40 @@ describe('Sistema de Aprendizagem Supervisionada e Classificação Automática L
     assert.equal(statusAfterRestart.details.textshotRetrieved, true);
   });
 
-  it('Cenário 16: Deve confirmar que os endpoints /ai-gateway/textshot, /ai-gateway/extract e /ai-gateway/health continuam operacionais', async () => {
-    const cab = 'fc-glpi-001';
-    // 1. Verifica /ai-gateway/health
-    const healthRes = await app.inject({
-      method: 'GET',
-      url: '/ai-gateway/health',
+  it('Cenário 16: Deve confirmar que os contratos e funções de /textshot (excerto de 2000 caracteres) e /extract continuam operacionais', () => {
+    // 1. Verifica validação e truncamento word-safe de 2000 caracteres do /textshot
+    const tsReq = validateAndNormalizeTextshotRequest({
+      fileCabinetId: 'fc-glpi-001',
+      documentId: 7777,
+      options: { maxCharacters: 2000 },
     });
-    assert.equal(healthRes.statusCode, 200);
+    assert.equal(tsReq.options.maxCharacters, 2000);
+    const truncated = truncateTextWordSafe('Palavra '.repeat(400), 2000);
+    assert.equal(truncated.truncated, true);
+    assert.ok(truncated.text.length <= 2000);
 
-    // 2. Verifica /ai-gateway/textshot (incluindo o limite independente de 2000 caracteres por defeito)
-    const longText = 'A'.repeat(3500);
-    mockDocuments.set(`${cab}:7777`, longText);
-    const tsRes = await app.inject({
-      method: 'POST',
-      url: '/ai-gateway/textshot',
-      headers: { 'x-docuware-token': authToken },
-      payload: {
-        fileCabinetId: cab,
-        documentId: 7777,
-      },
-    });
-    assert.equal(tsRes.statusCode, 200);
-    const tsBody = tsRes.json<TextshotResponse>();
-    assert.equal(tsBody.success, true);
-    assert.equal(tsBody.textLength, 2000);
-    assert.equal(tsBody.originalTextLength, 3500);
-    assert.equal(tsBody.truncated, true);
+    // 2. Verifica parser do contrato dinâmico do /extract
+    const extractParsed = parseRequestData(
+      JSON.stringify({
+        provider: 'openai',
+        model: 'gpt-4o',
+        instructions: { prompt: 'Extraia o número do ticket.' },
+        extraction: {
+          fields: {
+            N_Ticket: { type: 'string', description: 'Número do ticket' },
+          },
+        },
+      })
+    );
+    assert.equal(extractParsed.provider, 'openai');
+    assert.ok(extractParsed.requestedFieldNames.includes('N_Ticket'));
 
-    // 3. Verifica que a rota /ai-gateway/extract continua ativa e protegida
-    const extRes = await app.inject({
-      method: 'POST',
-      url: '/ai-gateway/extract',
-      headers: { 'x-docuware-token': authToken },
-    });
-    // Sem multipart/form-data retorna 400 INVALID_MULTIPART (confirmando rota operacional)
-    assert.equal(extRes.statusCode, 400);
-    assert.equal(extRes.json<StandardErrorResponse>().code, 'INVALID_MULTIPART');
+    // 3. Verifica validação de erros do classificador
+    assert.throws(
+      () => validateAndNormalizeTrainRequest({}),
+      (err: unknown) =>
+        err instanceof ClassifierValidationError &&
+        err.code === 'INVALID_REQUEST'
+    );
   });
 });

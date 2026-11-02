@@ -17,7 +17,7 @@ COPY ml ./ml
 COPY src ./src
 
 # Compila TypeScript para JavaScript em ./dist e executa suíte de testes automatizados
-RUN npm run build && npm test
+RUN npm run build && NODE_ENV=test npm test
 
 # Remove devDependencies mantendo apenas pacotes de produção
 RUN npm prune --omit=dev
@@ -29,10 +29,8 @@ FROM node:22-alpine AS runner
 
 WORKDIR /app
 
-# Instala Python 3 + scikit-learn para o motor local de classificação supervisionada
-# e cria o diretório persistente /app/data com permissões para o utilizador 'node'
-RUN apk add --no-cache python3 py3-scikit-learn && \
-    mkdir -p /app/data && \
+# Cria o diretório persistente /app/data com permissões para o utilizador 'node'
+RUN mkdir -p /app/data && \
     chown -R node:node /app/data
 
 ENV NODE_ENV=production

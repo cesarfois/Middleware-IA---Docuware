@@ -177,6 +177,6 @@ export const config: AppConfig = {
     2
   ),
   classifierUsePythonEngine:
-    (process.env.CLASSIFIER_USE_PYTHON_ENGINE || 'true').toLowerCase() !==
-    'false',
+    (process.env.CLASSIFIER_USE_PYTHON_ENGINE || 'false').toLowerCase() ===
+    'true',
 };

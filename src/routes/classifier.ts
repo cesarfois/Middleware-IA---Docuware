@@ -3,7 +3,7 @@ import { verifyDocuWareAuth } from '../auth.js';
 import {
   ClassifierService,
   ClassifierValidationError,
-  classifierService as defaultClassifierService,
+  getDefaultClassifierService,
   validateAndNormalizeClassifyRequest,
   validateAndNormalizeTrainRequest,
 } from '../classifier-service.js';
@@ -19,8 +19,9 @@ function parseJsonBodyIfNeeded(rawBody: unknown): unknown {
 
 export async function registerClassifierRoutes(
   app: FastifyInstance,
-  service: ClassifierService = defaultClassifierService
+  customService?: ClassifierService
 ): Promise<void> {
+  const service = customService ?? getDefaultClassifierService();
   // Retoma quaisquer trabalhos que tenham ficado interrompidos num reinício anterior
   service.recoverAndResumeQueue();
 
@@ -239,3 +240,4 @@ export async function registerClassifierRoutes(
   app.post('/classify', routeOptions, handleClassifyRequest);
   app.post('/api/classify', routeOptions, handleClassifyRequest);
 }
+

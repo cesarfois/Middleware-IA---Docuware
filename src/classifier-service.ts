@@ -652,8 +652,14 @@ export class ClassifierService {
           completedAt: countNow < minReq && !upsertResult.wasCorrection ? new Date().toISOString() : null,
         });
 
-        // Verifica se alguma categoria atingiu >= 10 exemplos ou se houve correção que exige retreino
-        await this.evaluateAndTrainModelIfNeeded();
+        // Se não houver outros exemplos aguardando na fila imediata, dispara a avaliação/treino agora;
+        // caso contrário, o treino será executado assim que o lote atual da fila terminar de guardar os exemplos.
+        const hasMoreQueued = this.store
+          .getPendingOrInterruptedJobs()
+          .some((j) => j.status === 'queued');
+        if (!hasMoreQueued) {
+          await this.evaluateAndTrainModelIfNeeded();
+        }
         return;
       } catch (err) {
         lastError = err;
@@ -889,4 +895,11 @@ export class ClassifierService {
   }
 }
 
-export const classifierService = new ClassifierService();
+let defaultServiceInstance: ClassifierService | null = null;
+
+export function getDefaultClassifierService(): ClassifierService {
+  if (!defaultServiceInstance) {
+    defaultServiceInstance = new ClassifierService();
+  }
+  return defaultServiceInstance;
+}

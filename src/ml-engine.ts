@@ -506,29 +506,40 @@ function trainAndValidateInNode(
       );
       const probs = softmax(logits);
 
-      const ranked = probs
-        .map((p, idx) => ({ p, lbl: uniqueLabels[idx] }))
-        .sort((a, b) => b.p - a.p);
+      const scored = uniqueLabels
+        .map((lbl, idx) => {
+          const p = probs[idx];
+          const sim = cosineSimilarity(x, foldModel.classCentroids[lbl] || []);
+          const calibrated = 0.65 * p + 0.35 * Math.min(1.0, sim / 0.35);
+          return {
+            lbl,
+            p,
+            sim,
+            calibrated: Math.min(0.99, Math.max(0, calibrated)),
+          };
+        })
+        .sort((a, b) => b.calibrated - a.calibrated);
 
-      const best = ranked[0];
-      const second = ranked[1] ?? { p: 0, lbl: best.lbl };
-      const simC = cosineSimilarity(
-        x,
-        foldModel.classCentroids[best.lbl] || []
-      );
-      const calibratedConf = 0.65 * best.p + 0.35 * Math.min(1.0, simC / 0.35);
-      const margin = best.p - second.p;
-
-      if (
-        calibratedConf < minConfidence ||
-        margin < minMargin ||
-        simC < 0.08
-      ) {
-        reviewCount++;
-      }
+      const best = scored[0];
+      const second = scored[1] ?? {
+        lbl: best.lbl,
+        p: 0,
+        sim: 0,
+        calibrated: 0,
+      };
+      const margin = best.calibrated - second.calibrated;
 
       yTrueAll.push(valY[i]);
-      yPredAll.push(best.lbl);
+      if (
+        best.calibrated < minConfidence ||
+        margin < minMargin ||
+        best.sim < 0.15
+      ) {
+        reviewCount++;
+        yPredAll.push('__needs_review__');
+      } else {
+        yPredAll.push(best.lbl);
+      }
     }
   }
 
@@ -539,11 +550,17 @@ function trainAndValidateInNode(
   const cm: number[][] = Array.from({ length: uniqueLabels.length }, () =>
     new Array<number>(uniqueLabels.length).fill(0)
   );
+  const fnUnclassified = new Array<number>(uniqueLabels.length).fill(0);
 
   let correctCount = 0;
   for (let i = 0; i < yTrueAll.length; i++) {
     const tIdx = labelToIdx.get(yTrueAll[i]) ?? 0;
-    const pIdx = labelToIdx.get(yPredAll[i]) ?? 0;
+    const predLbl = yPredAll[i];
+    if (predLbl === '__needs_review__') {
+      fnUnclassified[tIdx]++;
+      continue;
+    }
+    const pIdx = labelToIdx.get(predLbl) ?? 0;
     cm[tIdx][pIdx]++;
     if (tIdx === pIdx) correctCount++;
   }
@@ -556,7 +573,7 @@ function trainAndValidateInNode(
     const lbl = uniqueLabels[c];
     const tp = cm[c][c];
     let fp = 0;
-    let fn = 0;
+    let fn = fnUnclassified[c];
     for (let k = 0; k < uniqueLabels.length; k++) {
       if (k !== c) {
         fp += cm[k][c];
@@ -828,3 +845,4 @@ export function predictWithModelArtifact(
     centroidSimilarity: Number(best.sim.toFixed(4)),
   };
 }
+

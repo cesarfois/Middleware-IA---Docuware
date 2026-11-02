@@ -14,12 +14,18 @@ export interface BuildAppOptions {
   classifierService?: ClassifierService;
 }
 
+const isTestRunner =
+  process.env.NODE_ENV === 'test' ||
+  Boolean(process.env.NODE_TEST_CONTEXT) ||
+  process.execArgv.includes('--test') ||
+  process.argv.some((arg) => arg.includes('.test.'));
+
 export async function buildApp(
   options: BuildAppOptions = {}
 ): Promise<FastifyInstance> {
   const app = Fastify({
     logger: {
-      level: config.nodeEnv === 'test' ? 'silent' : 'info',
+      level: isTestRunner ? 'silent' : 'info',
       // Garante que credenciais nunca vazem nos logs de requisição
       redact: ['req.headers.authorization', 'req.headers["x-docuware-token"]'],
     },
@@ -107,7 +113,7 @@ async function startServer(): Promise<void> {
   }
 }
 
-// Inicia o servidor automaticamente quando executado diretamente
-if (process.env.NODE_ENV !== 'test') {
+// Inicia o servidor automaticamente apenas quando executado diretamente fora do test runner
+if (!isTestRunner) {
   void startServer();
 }
