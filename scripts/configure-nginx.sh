@@ -118,3 +118,4 @@ if ! docker exec portal_nginx grep -rn "location /ai-gateway" /etc/nginx/ >/dev/
     nginx -t && nginx -s reload
   ' || true
 fi
+

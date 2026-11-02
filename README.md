@@ -1,8 +1,8 @@
-# Gateway Universal de Inteligência Documental (DocuWare Cloud 7.14 ↔ OpenAI GPT-4o)
+# Universal Document AI Gateway (100% Orientado por Contrato JSON)
 
-Microserviço containerizado em **Node.js (TypeScript + Fastify)** projetado para operar como **Gateway Universal de Extração Documental** para o **DocuWare Cloud 7.14**.
+Middleware genérico em **Node.js (TypeScript + Fastify)** para o **DocuWare Cloud 7.14**, livre de prompts de negócio, schemas fixos ou templates documentais predefinidos no backend.
 
-Com esta arquitetura orientada a metadados, você mantém **um único serviço na VPS** e define dinamicamente o que extrair e quais campos JSON retornar diretamente no editor **HTTP Body** de cada atividade de Workflow no DocuWare.
+Toda a configuração funcional da extração — provedor, modelo, parâmetros de processamento, instruções, regras, campos de extração e estrutura de resposta — é definida exclusivamente e dinamicamente pelo JSON enviado no campo `requestData` pelo **DocuWare Workflow Designer**.
 
 ---
 
@@ -14,161 +14,187 @@ Com esta arquitetura orientada a metadados, você mantém **um único serviço n
 | **HTTP Domínio (`portal_nginx`)** | `http://wp.processcloud.app/ai-gateway/extract` | `http://wp.processcloud.app/ai-gateway/health` |
 | **IP Direto (Porta `3014`)** | `http://13.140.173.35:3014/extract` | `http://13.140.173.35:3014/health` |
 
-* **Diretório na VPS:** `/app/middleware-ia-docuware`
-* **Container Docker:** `docuware-ai-gateway` (porta `3014`)
 * **Cabeçalho de Autenticação:** `X-DocuWare-Token: <API_AUTH_TOKEN>` ou `Authorization: Bearer <API_AUTH_TOKEN>`
+* **Formato de Entrada:** `multipart/form-data` contendo `file` (binário PDF) e `requestData` (JSON do contrato de extração).
 
 ---
 
-## 2. Arquitetura e Mecânica do Multipart no DocuWare 7.14
+## 2. Princípios Arquiteturais
 
-```text
-[DocuWare Cloud 7.14 - Workflow Designer]
-  │
-  ├─► [x] Anexar documento: PDF enviado no campo binário 'file'
-  └─► HTTP Body: JSON enviado automaticamente no campo 'requestData'
-         {
-           "system_instruction": "Você é um auditor de contratos...",
-           "prompt": "Extraia partes contratantes, vigência, valor e foro.",
-           "schema": {
-             "Contratante": "Razão social da contratante",
-             "Contratada": "Razão social da contratada",
-             "Vigencia_Inicio": "Data no formato dd/MM/yyyy",
-             "Valor_Total": "Valor numérico",
-             "Foro": "Cidade/Comarca"
-           }
-         }
-       │
-       ▼
-[Gateway Universal na VPS (wp.processcloud.app/ai-gateway/extract)]
-       │
-       ├─► 1. Valida Token (X-DocuWare-Token / Authorization Bearer)
-       ├─► 2. Lê o PDF em memória (sem gravar nada em disco) e valida assinatura %PDF-
-       ├─► 3. Interpreta o requestData e monta o JSON Schema dinâmico (strict: true)
-       ├─► 4. Executa OpenAI GPT-4o (com retry automático e backoff exponencial)
-       │
-       ▼
-[Retorno HTTP 200 OK - JSON Plano]
-  {
-    "Contratante": "Alfa Indústria Ltda",
-    "Contratada": "Beta Tecnologia S.A.",
-    "Vigencia_Inicio": "02/11/2026",
-    "Valor_Total": "15000.00",
-    "Foro": "Lisboa"
-  }
-```
+1. **Zero Prompts de Negócio no Backend:** O middleware não possui conhecimento de tipos documentais específicos. Apenas uma diretiva técnica de protocolo (conformidade estrita com o JSON Schema) acompanha as instruções enviadas no `requestData`.
+2. **Zero Schemas Fixos:** Nenhum nome de campo existe no código-fonte. O JSON Schema (`strict: true`, `additionalProperties: false`, `required` integral) é construído dinamicamente a partir de `extraction.fields`.
+3. **Sem Fallback Silencioso:** Se `requestData` estiver ausente, vazio, em texto plano ou sem definição de instruções/campos, o middleware retorna erro explícito HTTP `422` com `code: "INVALID_CONFIGURATION"`.
+4. **Validação e Filtragem Estrita de Saída:** A resposta JSON entregue ao DocuWare passa por `validateAndFilterResponse`, garantindo que contenha **exclusivamente** as propriedades solicitadas naquela requisição, sem adicionar nem renomear chaves.
+5. **Múltiplos Provedores Protegidos no Servidor:** O contrato JSON pode selecionar o `provider` (`"openai"`, `"gemini"`, `"openai_compatible"`) e o `model`, enquanto as chaves de API e endpoints permanecem protegidos no `.env` do servidor.
 
 ---
 
-## 3. Como Configurar no DocuWare Cloud 7.14
+## 3. Contrato JSON Padronizado (v2)
 
-### Passo 1: Cadastrar o Serviço Web (1 única vez)
-Em **DocuWare Configurações (Configurations)** ➔ **Web Services**:
-1. Crie um novo serviço **REST**:
-   * **Nome:** `Gateway Universal IA`
-   * **URL Raiz:** `https://wp.processcloud.app/ai-gateway`
-2. Em **Cabeçalhos Padrão (Default Headers)**, adicione:
-   * **Nome:** `X-DocuWare-Token`
-   * **Valor:** `docuware_token_2026` *(valor definido em `API_AUTH_TOKEN` no `.env` da VPS)*
+No editor **HTTP Body** da atividade **Web Service** do DocuWare Workflow Designer, envie a configuração seguindo o contrato canônico abaixo:
 
----
-
-### Passo 2: Configurar a Atividade no Workflow Designer
-Em qualquer fluxo do **DocuWare Workflow Designer**, adicione uma atividade **Web Service**:
-
-1. **Aba Pedido (Request):**
-   * **Serviço Web:** `Gateway Universal IA`
-   * **Método HTTP:** `POST`
-   * **Rota / Caminho:** `/extract`
-   * **Anexo:** Marque **[x] Anexar documento** (*Attach document*)
-   * **HTTP Body:** Cole o JSON com o `prompt` e o `schema` desejado para aquele fluxo (veja exemplos na Seção 4).
-2. **Aba Resposta (Response):**
-   * Clique em **Enviar Pedido de Teste (Send Test Request)** anexando um PDF de exemplo.
-   * Mapeie os campos retornados (`$.Campo_1`, `$.Campo_2`, etc.) diretamente para os campos de índice do armário ou variáveis globais do Workflow.
-
----
-
-## 4. Templates Prontos para o "HTTP Body" do DocuWare
-
-Basta copiar e colar no campo **HTTP Body** da atividade do DocuWare Workflow Designer:
-
-### A) Contratos
 ```json
 {
-  "system_instruction": "Você é um auditor jurídico especialista em análise de contratos corporativos.",
-  "prompt": "Identifique as partes contratantes, NIF/CNPJ, data de início de vigência, valor total acordado e o foro.",
-  "schema": {
-    "Contratante": "Razão social da parte contratante",
-    "Documento_Contratante": "NIF ou CNPJ da contratante",
-    "Contratada": "Razão social da prestadora/contratada",
-    "Documento_Contratada": "NIF ou CNPJ da contratada",
-    "Vigencia_Inicio": "Data de início no formato dd/MM/yyyy",
-    "Vigencia_Fim": "Data de término no formato dd/MM/yyyy ou Indeterminado",
-    "Valor_Total": "Valor numérico formatado (ex: 15000.00)",
-    "Foro": "Cidade/Comarca eleita"
+  "provider": "openai",
+  "model": "gpt-4o",
+  "processing": {
+    "strategy": "native_pdf",
+    "temperature": 0,
+    "max_output_tokens": 2048,
+    "timeout_ms": 45000
+  },
+  "instructions": {
+    "system": "Papel ou contexto definido pelo próprio workflow.",
+    "prompt": "Instrução principal do que deve ser analisado no documento PDF anexo.",
+    "rules": [
+      "Regra 1 definida pelo workflow",
+      "Regra 2 definida pelo workflow"
+    ]
+  },
+  "extraction": {
+    "fields": {
+      "Campo_Personalizado_1": {
+        "type": "string",
+        "description": "Descrição do campo 1",
+        "format": "dd/MM/yyyy",
+        "rule": "Regra específica deste campo"
+      },
+      "Campo_Personalizado_2": {
+        "type": "string",
+        "description": "Descrição do campo 2"
+      }
+    }
+  },
+  "response": {
+    "strict": true,
+    "null_handling": "empty_string"
   }
 }
 ```
 
-### B) Faturas / Notas Fiscais
+### Especificação das Seções do Contrato
+
+| Bloco | Obrigatório | Descrição |
+| :--- | :---: | :--- |
+| `provider` | Opcional | Provedor habilitado no servidor: `"openai"` (padrão), `"gemini"` ou `"openai_compatible"`. |
+| `model` | Opcional | Modelo do provedor (ex.: `"gpt-4o"`, `"gpt-4o-mini"`, `"gemini-2.5-flash"`). |
+| `processing` | Opcional | Parâmetros técnicos de execução (`strategy`, `temperature`, `max_output_tokens`, `timeout_ms`). |
+| `instructions` | **Sim** | Contém `prompt` (**obrigatório**), `system` (opcional) e `rules` (lista opcional de regras encaminhadas integralmente ao modelo). |
+| `extraction` | **Sim** | Contém `fields` (**obrigatório**, com pelo menos 1 campo). Aceita objeto `{ "NomeCampo": { "type": "string", ... } }` ou lista `[{ "name": "NomeCampo", "type": "string", ... }]`. |
+| `response` | Opcional | Define `strict` (`true`) e `null_handling` (`"empty_string"` padrão, `"type_default"` ou `"preserve_null"`). |
+
+---
+
+## 4. Adaptador Explícito de Compatibilidade Legada (v1)
+
+Para preservar fluxos já configurados anteriormente sem misturar os formatos, o módulo [`adaptLegacyRequestData`](src/schema-builder.ts) converte explicitamente requisições que utilizem exclusivamente as três chaves do formato anterior (`system_instruction`, `prompt`, `schema`):
+
 ```json
 {
-  "system_instruction": "Você é um analista fiscal sênior responsável pela conferência de faturas e notas fiscais.",
-  "prompt": "Extraia os dados de cabeçalho da fatura, impostos, valor total e resumo dos itens.",
+  "system_instruction": "Contexto opcional definido pelo workflow",
+  "prompt": "Instrução obrigatória definida pelo workflow",
   "schema": {
-    "Numero_Fatura": "Número da fatura ou nota fiscal",
-    "Data_Emissao": "Data de emissão no formato dd/MM/yyyy",
-    "Data_Vencimento": "Data de vencimento no formato dd/MM/yyyy",
-    "Fornecedor_Nome": "Razão social do emitente",
-    "Fornecedor_NIF": "NIF ou CNPJ do emitente",
-    "Valor_Liquido": "Valor líquido sem impostos (ex: 1000.00)",
-    "Valor_IVA": "Valor total de impostos/IVA (ex: 230.00)",
-    "Valor_Total": "Valor total da fatura (ex: 1230.00)",
-    "Itens_Resumo": "Resumo dos itens separados por ponto e vírgula"
+    "Campo_A": "Descrição do Campo A",
+    "Campo_B": "Descrição do Campo B"
   }
 }
 ```
+> **Nota:** Não é permitido misturar chaves do contrato canônico (`instructions`, `extraction`, `provider`, `processing`, `response`) com chaves do formato legado (`system_instruction`, `prompt`, `schema`) na mesma requisição.
 
-### C) Guia de Remessa / Transporte
+---
+
+## 5. Teste de Aceitação Obrigatório (Mesmo PDF, 3 Contratos Distintos)
+
+O script [`tests/curl-examples.sh`](tests/curl-examples.sh) executa o teste de aceitação enviando **o mesmo arquivo PDF três vezes** ao endpoint `https://wp.processcloud.app/ai-gateway/extract`:
+
+### 1ª Execução: Solicitando somente `Cliente` e `Telefone`
+```bash
+curl -s -X POST "https://wp.processcloud.app/ai-gateway/extract" \
+  -H "X-DocuWare-Token: docuware_token_2026" \
+  -F "file=@./documento.pdf;type=application/pdf" \
+  -F 'requestData={
+    "provider": "openai",
+    "model": "gpt-4o",
+    "instructions": {
+      "prompt": "Extraia apenas os dados solicitados nos campos abaixo."
+    },
+    "extraction": {
+      "fields": {
+        "Cliente": { "type": "string", "description": "Nome do cliente" },
+        "Telefone": { "type": "string", "description": "Telefone de contato" }
+      }
+    }
+  }'
+```
+**Resposta (exclusivamente os 2 campos solicitados):**
 ```json
 {
-  "system_instruction": "Você é um especialista em logística e conferência de guias de remessa e transporte.",
-  "prompt": "Extraia o número da guia, data, remetente, destinatário, matrícula da viatura e resumo da mercadoria.",
-  "schema": {
-    "Numero_Guia": "Número da guia de remessa ou transporte",
-    "Data_Guia": "Data de emissão no formato dd/MM/yyyy",
-    "Remetente": "Nome ou razão social do remetente",
-    "Destinatario": "Nome ou razão social do destinatário",
-    "Local_Descarga": "Morada ou cidade de entrega",
-    "Matricula_Viatura": "Matrícula/placa do veículo transportador",
-    "Total_Volumes": "Quantidade total de volumes ou peso total",
-    "Assinatura_Rececao": "SIM ou NAO indicando se a guia está assinada pelo recebedor"
-  }
+  "Cliente": "...",
+  "Telefone": "..."
 }
 ```
 
-### D) Ficha de Intervenção Técnica / Formulário Manuscrito
+### 2ª Execução (Mesmo PDF): Solicitando somente `N_Ticket`, `Tecnico` e `Numero_Serie`
+```bash
+curl -s -X POST "https://wp.processcloud.app/ai-gateway/extract" \
+  -H "X-DocuWare-Token: docuware_token_2026" \
+  -F "file=@./documento.pdf;type=application/pdf" \
+  -F 'requestData={
+    "provider": "openai",
+    "model": "gpt-4o",
+    "instructions": {
+      "prompt": "Extraia apenas os identificadores solicitados nos campos abaixo."
+    },
+    "extraction": {
+      "fields": {
+        "N_Ticket": { "type": "string", "description": "Número do ticket" },
+        "Tecnico": { "type": "string", "description": "Nome do técnico" },
+        "Numero_Serie": { "type": "string", "description": "Número de série" }
+      }
+    }
+  }'
+```
+**Resposta (exclusivamente os 3 campos solicitados):**
 ```json
 {
-  "system_instruction": "Você é um especialista em OCR de documentos de campo e leitura de caligrafia manuscrita em fichas técnicas.",
-  "prompt": "Leia cuidadosamente os campos impressos e manuscritos desta ficha de intervenção técnica.",
-  "schema": {
-    "Numero_OS": "Número da Ordem de Serviço ou Ficha",
-    "Data_Intervencao": "Data do atendimento no formato dd/MM/yyyy",
-    "Cliente": "Nome do cliente atendido",
-    "Equipamento_Serie": "Modelo ou número de série do equipamento",
-    "Tecnico_Responsavel": "Nome do técnico que executou o serviço",
-    "Relatorio_Manuscrito": "Transcrição fiel das observações manuscritas sobre o defeito e solução aplicada",
-    "Pecas_Substituidas": "Lista de peças utilizadas ou substituídas",
-    "Status_Final": "Concluído, Pendente de Peça ou Em Aberto",
-    "Assinado_Cliente": "SIM ou NAO indicando se há assinatura manuscrita no campo do cliente"
-  }
+  "N_Ticket": "...",
+  "Tecnico": "...",
+  "Numero_Serie": "..."
+}
+```
+
+### 3ª Execução (Mesmo PDF): Solicitando somente `Campo_A`, `Campo_B` e `Campo_C`
+```bash
+curl -s -X POST "https://wp.processcloud.app/ai-gateway/extract" \
+  -H "X-DocuWare-Token: docuware_token_2026" \
+  -F "file=@./documento.pdf;type=application/pdf" \
+  -F 'requestData={
+    "provider": "openai",
+    "model": "gpt-4o",
+    "instructions": {
+      "prompt": "Extraia os valores solicitados nas propriedades personalizadas abaixo."
+    },
+    "extraction": {
+      "fields": {
+        "Campo_A": { "type": "string", "description": "Primeira informação solicitada" },
+        "Campo_B": { "type": "string", "description": "Segunda informação solicitada" },
+        "Campo_C": { "type": "string", "description": "Terceira informação solicitada" }
+      }
+    }
+  }'
+```
+**Resposta (exclusivamente os 3 campos solicitados):**
+```json
+{
+  "Campo_A": "...",
+  "Campo_B": "...",
+  "Campo_C": "..."
 }
 ```
 
 ---
 
-## 5. Estrutura do Repositório
+## 6. Estrutura do Repositório e CI/CD
 
 ```text
 .
@@ -177,61 +203,22 @@ Basta copiar e colar no campo **HTTP Body** da atividade do DocuWare Workflow De
 ├── scripts/
 │   └── configure-nginx.sh     # Script idempotente que configura /ai-gateway/ no portal_nginx
 ├── src/
-│   ├── server.ts              # Inicialização Fastify, limites multipart, handler global e graceful shutdown
-│   ├── config.ts              # Leitura e validação tipada de variáveis de ambiente (.env)
-│   ├── types.ts               # Interfaces TypeScript do contrato DocuWare <-> OpenAI
+│   ├── server.ts              # Inicialização Fastify, limites multipart e handler global
+│   ├── config.ts              # Credenciais e configurações protegidas por variáveis de ambiente (.env)
+│   ├── types.ts               # Contrato Canônico v2, Adaptador Legado v1 e tipos de validação
 │   ├── auth.ts                # Autenticação time-safe (X-DocuWare-Token ou Authorization: Bearer)
-│   ├── schema-builder.ts      # Parser resiliente de requestData e gerador de JSON Schema (strict: true)
-│   ├── openai-service.ts      # Cliente OpenAI GPT-4o multimodal (PDF Base64) + Retry com Backoff Exponencial
+│   ├── schema-builder.ts      # Validador de contrato, gerador dinâmico de JSON Schema e filtro estrito de saída
+│   ├── openai-service.ts      # Dispatcher multi-provider (OpenAI / Gemini / Compatible) com retry exponencial
 │   ├── routes/
-│   │   ├── extract.ts         # Endpoints POST (/extract, /ai-gateway/extract, /api/extract, /)
-│   │   └── health.ts          # Endpoints GET (/health, /ai-gateway/health)
+│   │   ├── extract.ts         # Endpoints POST (/ai-gateway/extract, /extract, /api/extract, /)
+│   │   └── health.ts          # Endpoints GET (/ai-gateway/health, /health)
 │   └── tests/
-│       └── gateway.test.ts    # Testes unitários do parser, schema builder, PDF validator e auth
+│       └── gateway.test.ts    # Suíte de testes unitários e teste de aceitação das 3 execuções
 ├── tests/
-│   └── curl-examples.sh       # Exemplos prontos de chamadas curl para os cenários A, B, C e D
-├── Dockerfile                 # Build Multi-Stage Node 22 Alpine (execução segura sob usuário não-root)
-├── docker-compose.yml         # Deploy de produção com limites de recursos e reverse-proxy-network
-├── .env.example               # Modelo de variáveis de ambiente
+│   └── curl-examples.sh       # Script executável com o Teste de Aceitação Obrigatório (3 execuções no mesmo PDF)
+├── Dockerfile
+├── docker-compose.yml
+├── .env.example
 ├── package.json
 └── tsconfig.json
 ```
-
----
-
-## 6. Testes via `curl`
-
-### Verificar Healthcheck (HTTPS)
-```bash
-curl https://wp.processcloud.app/ai-gateway/health
-```
-
-### Enviar PDF + Instruções Dinâmicas (`requestData`)
-```bash
-curl -X POST "https://wp.processcloud.app/ai-gateway/extract" \
-  -H "X-DocuWare-Token: docuware_token_2026" \
-  -F "file=@./contrato.pdf;type=application/pdf" \
-  -F 'requestData={
-    "system_instruction": "Você é um auditor jurídico especialista em contratos.",
-    "prompt": "Extraia as partes contratantes, vigência, valor total e foro.",
-    "schema": {
-      "Contratante": "Razão social da contratante",
-      "Contratada": "Razão social da contratada",
-      "Vigencia_Inicio": "Data no formato dd/MM/yyyy",
-      "Valor_Total": "Valor numérico ou formatado",
-      "Foro": "Cidade/Comarca"
-    }
-  }'
-```
-
----
-
-## 7. Deploy Contínuo Automático (GitHub Actions ➔ Contabo VPS)
-
-Qualquer commit enviado (`git push`) para a branch `main` no repositório `https://github.com/cesarfois/Middleware-IA---Docuware.git` dispara automaticamente o workflow [`.github/workflows/deploy.yml`](.github/workflows/deploy.yml):
-
-1. Conecta via SSH na VPS Contabo usando os GitHub Repository Secrets (`VPS_HOST`, `VPS_USER`, `VPS_SSH_KEY`).
-2. Atualiza o código em `/app/middleware-ia-docuware` preservando o arquivo `.env` de produção.
-3. Reconstrói a imagem Docker (`docker compose build` + `docker compose up -d`).
-4. Executa [`scripts/configure-nginx.sh`](scripts/configure-nginx.sh) garantindo que o `portal_nginx` encaminhe `/ai-gateway/` para `http://docuware-ai-gateway:3014`.
-5. Valida o healthcheck tanto na porta local (`3014`) quanto via Nginx (`wp.processcloud.app/ai-gateway/health`).

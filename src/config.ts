@@ -2,6 +2,12 @@ import dotenv from 'dotenv';
 
 dotenv.config();
 
+export interface ProviderCredentials {
+  apiKey: string;
+  baseUrl?: string;
+  defaultModel: string;
+}
+
 export interface AppConfig {
   port: number;
   host: string;
@@ -9,6 +15,13 @@ export interface AppConfig {
   apiAuthToken: string;
   openaiApiKey: string;
   openaiModel: string;
+  openaiBaseUrl?: string;
+  geminiApiKey: string;
+  geminiModel: string;
+  geminiBaseUrl: string;
+  customAiApiKey: string;
+  customAiBaseUrl?: string;
+  customAiModel: string;
   openaiTimeoutMs: number;
   openaiMaxRetries: number;
   maxFileSizeBytes: number;
@@ -27,9 +40,17 @@ export const config: AppConfig = {
   apiAuthToken: (process.env.API_AUTH_TOKEN || '').trim(),
   openaiApiKey: (process.env.OPENAI_API_KEY || '').trim(),
   openaiModel: (process.env.OPENAI_MODEL || 'gpt-4o').trim(),
+  openaiBaseUrl: (process.env.OPENAI_BASE_URL || '').trim() || undefined,
+  geminiApiKey: (process.env.GEMINI_API_KEY || '').trim(),
+  geminiModel: (process.env.GEMINI_MODEL || 'gemini-2.5-flash').trim(),
+  geminiBaseUrl:
+    (process.env.GEMINI_BASE_URL || '').trim() ||
+    'https://generativelanguage.googleapis.com/v1beta/openai/',
+  customAiApiKey: (process.env.CUSTOM_AI_API_KEY || '').trim(),
+  customAiBaseUrl: (process.env.CUSTOM_AI_BASE_URL || '').trim() || undefined,
+  customAiModel: (process.env.CUSTOM_AI_MODEL || 'gpt-4o').trim(),
   openaiTimeoutMs: parsePositiveInt(process.env.OPENAI_TIMEOUT_MS, 45000),
   openaiMaxRetries: parsePositiveInt(process.env.OPENAI_MAX_RETRIES, 2),
   // Padrão: 30 MB (31.457.280 bytes)
   maxFileSizeBytes: parsePositiveInt(process.env.MAX_FILE_SIZE, 30 * 1024 * 1024),
 };
-

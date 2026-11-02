@@ -9,18 +9,24 @@ services:
       - .env
     environment:
       - NODE_ENV=${NODE_ENV:-production}
-      - PORT=${PORT:-3000}
+      - PORT=${PORT:-3014}
       - HOST=0.0.0.0
       - OPENAI_API_KEY=${OPENAI_API_KEY}
       - OPENAI_MODEL=${OPENAI_MODEL:-gpt-4o}
+      - OPENAI_BASE_URL=${OPENAI_BASE_URL:-}
+      - GEMINI_API_KEY=${GEMINI_API_KEY:-}
+      - GEMINI_MODEL=${GEMINI_MODEL:-gemini-2.5-flash}
+      - CUSTOM_AI_API_KEY=${CUSTOM_AI_API_KEY:-}
+      - CUSTOM_AI_BASE_URL=${CUSTOM_AI_BASE_URL:-}
+      - CUSTOM_AI_MODEL=${CUSTOM_AI_MODEL:-gpt-4o}
       - OPENAI_TIMEOUT_MS=${OPENAI_TIMEOUT_MS:-45000}
       - OPENAI_MAX_RETRIES=${OPENAI_MAX_RETRIES:-2}
       - API_AUTH_TOKEN=${API_AUTH_TOKEN}
       - MAX_FILE_SIZE=${MAX_FILE_SIZE:-31457280}
     expose:
-      - "${PORT:-3000}"
+      - "${PORT:-3014}"
     ports:
-      - "${PORT:-3000}:${PORT:-3000}"
+      - "${PORT:-3014}:${PORT:-3014}"
     mem_limit: 1g
     cpus: 1.5
     security_opt:
@@ -35,4 +41,3 @@ networks:
   default:
     external: true
     name: reverse-proxy-network
-

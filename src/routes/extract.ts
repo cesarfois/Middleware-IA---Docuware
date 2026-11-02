@@ -5,8 +5,14 @@ import {
   ExtractionServiceError,
   extractDocumentWithOpenAI,
 } from '../openai-service.js';
-import { parseRequestData } from '../schema-builder.js';
-import type { StandardErrorResponse } from '../types.js';
+import {
+  RequestValidationError,
+  parseRequestData,
+} from '../schema-builder.js';
+import type {
+  NormalizedExtractionRequest,
+  StandardErrorResponse,
+} from '../types.js';
 
 /**
  * Valida se o Buffer corresponde a um arquivo PDF válido verificando os magic bytes "%PDF-"
@@ -16,7 +22,9 @@ export function isValidPdfBuffer(buffer: Buffer): boolean {
   if (!buffer || buffer.byteLength < 5) {
     return false;
   }
-  const headerSlice = buffer.subarray(0, Math.min(buffer.byteLength, 1024)).toString('latin1');
+  const headerSlice = buffer
+    .subarray(0, Math.min(buffer.byteLength, 1024))
+    .toString('latin1');
   return headerSlice.includes('%PDF-');
 }
 
@@ -30,7 +38,8 @@ async function handleDocumentExtraction(
     const payload: StandardErrorResponse = {
       error: true,
       code: 'INVALID_MULTIPART',
-      message: 'A requisição deve ser enviada com Content-Type: multipart/form-data.',
+      message:
+        'A requisição deve ser enviada com Content-Type: multipart/form-data.',
     };
     return reply.status(422).send(payload);
   }
@@ -45,7 +54,6 @@ async function handleDocumentExtraction(
 
     for await (const part of parts) {
       if (part.type === 'file') {
-        // Prioriza o campo 'file' enviado pelo DocuWare (ou aceita o primeiro arquivo anexado)
         if (part.fieldname === 'file' || pdfBuffer === null) {
           const chunks: Buffer[] = [];
           for await (const chunk of part.file) {
@@ -59,19 +67,18 @@ async function handleDocumentExtraction(
             pdfFilename = part.filename;
           }
         } else {
-          // Drena streams extras caso existam para não travar o parser multipart
           part.file.resume();
         }
       } else {
-        // Campo de texto do multipart: DocuWare envia o conteúdo do HTTP Body em `requestData`
         const fieldNameLower = part.fieldname.toLowerCase();
         if (
           part.fieldname === 'requestData' ||
-          fieldNameLower === 'requestdata' ||
-          (rawRequestData === null &&
-            ['request_data', 'body', 'instructions', 'payload'].includes(fieldNameLower))
+          fieldNameLower === 'requestdata'
         ) {
-          rawRequestData = typeof part.value === 'string' ? part.value : String(part.value ?? '');
+          rawRequestData =
+            typeof part.value === 'string'
+              ? part.value
+              : String(part.value ?? '');
         }
       }
     }
@@ -87,7 +94,10 @@ async function handleDocumentExtraction(
       return reply.status(422).send(payload);
     }
 
-    request.log.error({ errName: err instanceof Error ? err.name : 'Unknown' }, 'Erro ao ler multipart/form-data.');
+    request.log.error(
+      { errName: err instanceof Error ? err.name : 'Unknown' },
+      'Erro ao ler multipart/form-data.'
+    );
     const payload: StandardErrorResponse = {
       error: true,
       code: 'INVALID_MULTIPART',
@@ -119,13 +129,36 @@ async function handleDocumentExtraction(
     const payload: StandardErrorResponse = {
       error: true,
       code: 'INVALID_PDF',
-      message: 'O arquivo enviado no campo "file" não possui assinatura binária de um PDF válido (%PDF-).',
+      message:
+        'O arquivo enviado no campo "file" não possui assinatura binária de um PDF válido (%PDF-).',
     };
     return reply.status(422).send(payload);
   }
 
-  // Interpreta e normaliza as instruções dinâmicas enviadas pelo DocuWare em `requestData`
-  const extractionRequest = parseRequestData(rawRequestData);
+  // Valida estritamente o JSON requestData (sem fallback silencioso)
+  let extractionRequest: NormalizedExtractionRequest;
+  try {
+    extractionRequest = parseRequestData(rawRequestData);
+  } catch (err) {
+    const statusCode =
+      err instanceof RequestValidationError ? err.statusCode : 422;
+    const message =
+      err instanceof Error
+        ? err.message
+        : 'Configuração inválida no campo requestData.';
+
+    request.log.warn(
+      { status: 'INVALID_CONFIGURATION', httpStatus: statusCode, message },
+      'Requisição rejeitada por configuração inválida em requestData.'
+    );
+
+    const payload: StandardErrorResponse = {
+      error: true,
+      code: 'INVALID_CONFIGURATION',
+      message,
+    };
+    return reply.status(statusCode).send(payload);
+  }
 
   try {
     const { data, metrics } = await extractDocumentWithOpenAI(
@@ -135,19 +168,17 @@ async function handleDocumentExtraction(
       request.log
     );
 
-    // Log seguro de auditoria/métricas (sem gravar conteúdo confidencial do documento)
     request.log.info(
       {
         status: 'SUCCESS',
         httpStatus: 200,
         totalDurationMs: Date.now() - requestStartTime,
-        openaiDurationMs: metrics.durationMs,
+        providerDurationMs: metrics.durationMs,
         fileSizeBytes: metrics.fileSizeBytes,
+        provider: metrics.provider,
         model: metrics.model,
-        mode: metrics.mode,
-        schemaFieldsCount: extractionRequest.schemaDefinition
-          ? Object.keys(extractionRequest.schemaDefinition).length
-          : 0,
+        contractVersion: metrics.contractVersion,
+        requestedFieldsCount: metrics.requestedFieldsCount,
         promptTokens: metrics.promptTokens,
         completionTokens: metrics.completionTokens,
         totalTokens: metrics.totalTokens,
@@ -156,12 +187,16 @@ async function handleDocumentExtraction(
       'Extração documental concluída com sucesso.'
     );
 
-    // Retorna o JSON diretamente na raiz para mapeamento imediato no DocuWare Workflow Designer
     return reply.status(200).send(data);
   } catch (err) {
-    const statusCode = err instanceof ExtractionServiceError ? err.statusCode : 500;
+    const statusCode =
+      err instanceof ExtractionServiceError ? err.statusCode : 500;
+    const errorCode =
+      err instanceof ExtractionServiceError ? err.code : 'EXTRACTION_FAILED';
     const message =
-      err instanceof Error ? err.message : 'Erro interno durante a extração documental.';
+      err instanceof Error
+        ? err.message
+        : 'Erro interno durante a extração documental.';
 
     request.log.error(
       {
@@ -169,7 +204,9 @@ async function handleDocumentExtraction(
         httpStatus: statusCode,
         totalDurationMs: Date.now() - requestStartTime,
         fileSizeBytes: pdfBuffer.byteLength,
-        mode: extractionRequest.mode,
+        provider: extractionRequest.provider,
+        model: extractionRequest.model,
+        contractVersion: extractionRequest.contractVersion,
         errorMessage: message,
       },
       'Falha na extração documental.'
@@ -177,23 +214,23 @@ async function handleDocumentExtraction(
 
     const payload: StandardErrorResponse = {
       error: true,
-      code: 'EXTRACTION_FAILED',
+      code: errorCode,
       message,
     };
     return reply.status(statusCode).send(payload);
   }
 }
 
-export async function registerExtractRoutes(app: FastifyInstance): Promise<void> {
+export async function registerExtractRoutes(
+  app: FastifyInstance
+): Promise<void> {
   const routeOptions = {
     preHandler: verifyDocuWareAuth,
   };
 
-  // Endpoint principal e aliases (incluindo /ai-gateway para proxy reverso em wp.processcloud.app)
   app.post('/extract', routeOptions, handleDocumentExtraction);
   app.post('/api/extract', routeOptions, handleDocumentExtraction);
   app.post('/ai-gateway/extract', routeOptions, handleDocumentExtraction);
   app.post('/ai-gateway', routeOptions, handleDocumentExtraction);
   app.post('/', routeOptions, handleDocumentExtraction);
 }
-
