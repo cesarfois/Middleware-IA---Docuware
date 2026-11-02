@@ -29,16 +29,19 @@ jobs:
             git fetch origin main
             git reset --hard origin/main
 
-            echo "=== 3. Garantindo rede Docker e reconstruindo container ==="
+            echo "=== 3. Construindo nova imagem e recriando container de forma limpa ==="
             docker network create reverse-proxy-network 2>/dev/null || true
-            docker compose up -d --build --remove-orphans
+            docker compose build
+            docker compose down --remove-orphans 2>/dev/null || true
+            docker rm -f docuware-ai-gateway 2>/dev/null || true
+            docker compose up -d
 
             echo "=== 4. Limpando imagens antigas sem uso ==="
             docker image prune -f
 
             echo "=== 5. Validando Healthcheck ==="
             sleep 3
-            PORT_VAL=$(grep -E '^PORT=' .env | cut -d '=' -f2 || echo "3014")
+            PORT_VAL=$(grep -E '^PORT=' .env | cut -d '=' -f2 | tr -d '\r' || echo "3014")
             curl --fail -s "http://localhost:${PORT_VAL:-3014}/health"
             echo ""
             echo "=== Deploy concluído com sucesso! ==="
