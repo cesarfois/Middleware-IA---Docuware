@@ -188,3 +188,13 @@ curl -X POST "http://localhost:3000/extract" \
   -F 'requestData=Extraia o Numero_Guia, Data_Expedicao, Transportadora, Placa_Veiculo e Peso_Total_Kg deste documento.'
 ```
 
+---
+
+## 5. Deploy Contínuo Automático (GitHub Actions -> Contabo VPS)
+
+O repositório conta com o workflow `.github/workflows/deploy.yml` que realiza o deploy automático na VPS da Contabo a cada `git push` na branch `main`:
+1. Conecta via SSH usando os Secrets `VPS_HOST`, `VPS_USER` e `VPS_SSH_KEY`.
+2. Atualiza o código em `/app/middleware-ia-docuware` preservando o arquivo `.env` local da VPS.
+3. Executa `docker compose up -d --build --remove-orphans` e valida o endpoint `/health`.
+
+
