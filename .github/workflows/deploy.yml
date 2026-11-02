@@ -31,6 +31,7 @@ jobs:
 
             echo "=== 3. Construindo nova imagem e recriando container de forma limpa ==="
             docker network create reverse-proxy-network 2>/dev/null || true
+            docker network connect reverse-proxy-network portal_nginx 2>/dev/null || true
             docker compose build
             docker compose down --remove-orphans 2>/dev/null || true
             docker rm -f docuware-ai-gateway 2>/dev/null || true

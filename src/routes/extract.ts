@@ -189,9 +189,11 @@ export async function registerExtractRoutes(app: FastifyInstance): Promise<void>
     preHandler: verifyDocuWareAuth,
   };
 
-  // Endpoint principal e aliases para facilitar configuração no Web Service do DocuWare
+  // Endpoint principal e aliases (incluindo /ai-gateway para proxy reverso em wp.processcloud.app)
   app.post('/extract', routeOptions, handleDocumentExtraction);
   app.post('/api/extract', routeOptions, handleDocumentExtraction);
+  app.post('/ai-gateway/extract', routeOptions, handleDocumentExtraction);
+  app.post('/ai-gateway', routeOptions, handleDocumentExtraction);
   app.post('/', routeOptions, handleDocumentExtraction);
 }
 
