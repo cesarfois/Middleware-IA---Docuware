@@ -15,8 +15,8 @@ RUN npm install
 COPY tsconfig.json ./
 COPY src ./src
 
-# Compila TypeScript para JavaScript em ./dist
-RUN npm run build
+# Compila TypeScript para JavaScript em ./dist e executa suíte de testes automatizados
+RUN npm run build && npm test
 
 # Remove devDependencies mantendo apenas pacotes de produção
 RUN npm prune --omit=dev

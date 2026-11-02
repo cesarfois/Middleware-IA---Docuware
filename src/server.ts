@@ -3,9 +3,17 @@ import multipart from '@fastify/multipart';
 import { config } from './config.js';
 import { registerHealthRoutes } from './routes/health.js';
 import { registerExtractRoutes } from './routes/extract.js';
+import { registerTextshotRoutes } from './routes/textshot.js';
+import type { DocuWarePlatformClient } from './docuware-client.js';
 import type { StandardErrorResponse } from './types.js';
 
-export async function buildApp(): Promise<FastifyInstance> {
+export interface BuildAppOptions {
+  docuWareClient?: DocuWarePlatformClient;
+}
+
+export async function buildApp(
+  options: BuildAppOptions = {}
+): Promise<FastifyInstance> {
   const app = Fastify({
     logger: {
       level: config.nodeEnv === 'test' ? 'silent' : 'info',
@@ -38,6 +46,15 @@ export async function buildApp(): Promise<FastifyInstance> {
       return reply.status(422).send(payload);
     }
 
+    if (errCode === 'FST_ERR_CTP_INVALID_JSON_BODY') {
+      const payload: StandardErrorResponse = {
+        error: true,
+        code: 'INVALID_REQUEST',
+        message: 'Corpo JSON malformado na requisição.',
+      };
+      return reply.status(400).send(payload);
+    }
+
     request.log.error(
       { errName: error instanceof Error ? error.name : 'UnknownError' },
       'Erro não tratado capturado pelo ErrorHandler global.'
@@ -46,13 +63,17 @@ export async function buildApp(): Promise<FastifyInstance> {
     const payload: StandardErrorResponse = {
       error: true,
       code: 'EXTRACTION_FAILED',
-      message: error instanceof Error ? error.message : 'Erro interno inesperado no gateway.',
+      message:
+        error instanceof Error
+          ? error.message
+          : 'Erro interno inesperado no gateway.',
     };
     return reply.status(500).send(payload);
   });
 
   await registerHealthRoutes(app);
   await registerExtractRoutes(app);
+  await registerTextshotRoutes(app, options.docuWareClient);
 
   return app;
 }
@@ -61,7 +82,9 @@ async function startServer(): Promise<void> {
   const app = await buildApp();
 
   const closeGracefully = async (signal: string) => {
-    app.log.info(`Sinal ${signal} recebido. Encerrando servidor de forma segura...`);
+    app.log.info(
+      `Sinal ${signal} recebido. Encerrando servidor de forma segura...`
+    );
     await app.close();
     process.exit(0);
   };
@@ -84,4 +107,3 @@ async function startServer(): Promise<void> {
 if (process.env.NODE_ENV !== 'test') {
   void startServer();
 }
-

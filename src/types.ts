@@ -108,6 +108,89 @@ export interface ExtractionMetrics {
   attempts: number;
 }
 
+// ============================================================================
+// TIPOS DO ENDPOINT TEXTSHOT (DOCUWARE PLATFORM REST API)
+// ============================================================================
+
+export type TextshotErrorCode =
+  | 'INVALID_REQUEST'
+  | 'DOCUWARE_AUTH_FAILED'
+  | 'DOCUMENT_NOT_FOUND'
+  | 'TEXTSHOT_NOT_AVAILABLE'
+  | 'DOCUWARE_TIMEOUT'
+  | 'DOCUWARE_API_ERROR'
+  | 'TEXT_TOO_LARGE';
+
+export interface TextshotRequestOptions {
+  includePages?: boolean;
+  includeCoordinates?: boolean;
+  normalize?: boolean;
+  output?: 'text' | 'pages' | 'full';
+  maxCharacters?: number;
+}
+
+export interface TextshotRequestBody {
+  fileCabinetId?: unknown;
+  documentId?: unknown;
+  options?: TextshotRequestOptions;
+}
+
+export interface NormalizedTextshotRequest {
+  fileCabinetId: string;
+  documentId: number;
+  options: {
+    includePages: boolean;
+    includeCoordinates: boolean;
+    normalize: boolean;
+    output: 'text' | 'pages' | 'full';
+    maxCharacters?: number;
+  };
+}
+
+export interface TextshotCoordinateElement {
+  text: string;
+  left?: number;
+  top?: number;
+  width?: number;
+  height?: number;
+  confidence?: number;
+}
+
+export interface TextshotPageResult {
+  sectionId: string;
+  sectionIndex: number;
+  pageNumber: number;
+  globalPageNumber: number;
+  text: string;
+  textLength: number;
+  coordinatesAvailable: boolean;
+  elements?: TextshotCoordinateElement[];
+}
+
+export interface TextshotTimings {
+  authTimeMs: number;
+  metadataTimeMs: number;
+  textshotTimeMs: number;
+  totalTimeMs: number;
+}
+
+export interface TextshotResponse {
+  success: true;
+  documentId: number;
+  fileCabinetId: string;
+  source: 'docuware_textshot';
+  sectionCount: number;
+  pageCount: number;
+  text: string;
+  textLength: number;
+  originalTextLength: number;
+  truncated: boolean;
+  status: 'completed';
+  processingTimeMs: number;
+  timings: TextshotTimings;
+  pages?: TextshotPageResult[];
+}
+
 /**
  * Payload de erro padronizado para retorno ao DocuWare.
  */
@@ -122,6 +205,7 @@ export interface StandardErrorResponse {
     | 'INVALID_CONFIGURATION'
     | 'PROVIDER_NOT_AVAILABLE'
     | 'EXTRACTION_FAILED'
-    | 'INTERNAL_ERROR';
+    | 'INTERNAL_ERROR'
+    | TextshotErrorCode;
   message: string;
 }

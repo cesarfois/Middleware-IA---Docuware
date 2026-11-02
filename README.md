@@ -1,37 +1,106 @@
-# Universal Document AI Gateway (100% Orientado por Contrato JSON)
+# Universal Document AI Gateway (DocuWare Cloud 7.14)
 
-Middleware genérico em **Node.js (TypeScript + Fastify)** para o **DocuWare Cloud 7.14**, livre de prompts de negócio, schemas fixos ou templates documentais predefinidos no backend.
+Middleware genérico e containerizado em **Node.js (TypeScript + Fastify)** para o **DocuWare Cloud 7.14**, operando com dois endpoints independentes:
 
-Toda a configuração funcional da extração — provedor, modelo, parâmetros de processamento, instruções, regras, campos de extração e estrutura de resposta — é definida exclusivamente e dinamicamente pelo JSON enviado no campo `requestData` pelo **DocuWare Workflow Designer**.
+1. **`POST /ai-gateway/extract`**: Extração inteligente multimodal via provedor de IA (OpenAI / Gemini / Compatible), **100% orientada pelo contrato JSON (`requestData`)**, sem prompts ou schemas fixos no backend.
+2. **`POST /ai-gateway/textshot`**: Recuperação direta do **Textshot (OCR nativo já processado pelo DocuWare)** via **DocuWare Platform REST API**, sem reprocessar o PDF e sem chamar a OpenAI.
 
 ---
 
 ## 1. Endpoints em Produção (Contabo VPS)
 
-| Tipo de Acesso | Endpoint de Extração (`POST`) | Healthcheck (`GET`) |
+| Operação | Endpoint HTTPS (`portal_nginx`) | Endpoint IP Direto (Porta `3014`) |
 | :--- | :--- | :--- |
-| **HTTPS Principal (`portal_nginx`)** | `https://wp.processcloud.app/ai-gateway/extract` | `https://wp.processcloud.app/ai-gateway/health` |
-| **HTTP Domínio (`portal_nginx`)** | `http://wp.processcloud.app/ai-gateway/extract` | `http://wp.processcloud.app/ai-gateway/health` |
-| **IP Direto (Porta `3014`)** | `http://13.140.173.35:3014/extract` | `http://13.140.173.35:3014/health` |
+| **Extração IA (`POST`)** | `https://wp.processcloud.app/ai-gateway/extract` | `http://13.140.173.35:3014/extract` |
+| **Textshot Nativo (`POST`)** | `https://wp.processcloud.app/ai-gateway/textshot` | `http://13.140.173.35:3014/textshot` |
+| **Healthcheck (`GET`)** | `https://wp.processcloud.app/ai-gateway/health` | `http://13.140.173.35:3014/health` |
 
-* **Cabeçalho de Autenticação:** `X-DocuWare-Token: <API_AUTH_TOKEN>` ou `Authorization: Bearer <API_AUTH_TOKEN>`
-* **Formato de Entrada:** `multipart/form-data` contendo `file` (binário PDF) e `requestData` (JSON do contrato de extração).
-
----
-
-## 2. Princípios Arquiteturais
-
-1. **Zero Prompts de Negócio no Backend:** O middleware não possui conhecimento de tipos documentais específicos. Apenas uma diretiva técnica de protocolo (conformidade estrita com o JSON Schema) acompanha as instruções enviadas no `requestData`.
-2. **Zero Schemas Fixos:** Nenhum nome de campo existe no código-fonte. O JSON Schema (`strict: true`, `additionalProperties: false`, `required` integral) é construído dinamicamente a partir de `extraction.fields`.
-3. **Sem Fallback Silencioso:** Se `requestData` estiver ausente, vazio, em texto plano ou sem definição de instruções/campos, o middleware retorna erro explícito HTTP `422` com `code: "INVALID_CONFIGURATION"`.
-4. **Validação e Filtragem Estrita de Saída:** A resposta JSON entregue ao DocuWare passa por `validateAndFilterResponse`, garantindo que contenha **exclusivamente** as propriedades solicitadas naquela requisição, sem adicionar nem renomear chaves.
-5. **Múltiplos Provedores Protegidos no Servidor:** O contrato JSON pode selecionar o `provider` (`"openai"`, `"gemini"`, `"openai_compatible"`) e o `model`, enquanto as chaves de API e endpoints permanecem protegidos no `.env` do servidor.
+* **Cabeçalho de Autenticação (ambos os endpoints):** `X-DocuWare-Token: <API_AUTH_TOKEN>` ou `Authorization: Bearer <API_AUTH_TOKEN>`
 
 ---
 
-## 3. Contrato JSON Padronizado (v2)
+## 2. Endpoint `POST /ai-gateway/textshot` (OCR Nativo DocuWare Platform API)
 
-No editor **HTTP Body** da atividade **Web Service** do DocuWare Workflow Designer, envie a configuração seguindo o contrato canônico abaixo:
+Recupera o texto OCR já indexado no DocuWare Cloud (`DOCUWARE_PLATFORM_URL`, ex.: `https://rcsangola.docuware.cloud/DocuWare/Platform`) consultando os metadados do documento, descobrindo dinamicamente todas as seções (`Sections`) e consolidando os Textshots na ordem exata de seções e páginas.
+
+### Exemplo de HTTP Body para o DocuWare Workflow Designer (`Content-Type: application/json`)
+
+```json
+{
+  "fileCabinetId": "GUID_DO_ARMARIO",
+  "documentId": 12345,
+  "options": {
+    "includePages": true,
+    "includeCoordinates": false,
+    "normalize": true,
+    "output": "text",
+    "maxCharacters": 2000
+  }
+}
+```
+
+### Exemplo de Resposta JSON (`HTTP 200 OK`)
+
+```json
+{
+  "success": true,
+  "documentId": 12345,
+  "fileCabinetId": "GUID_DO_ARMARIO",
+  "source": "docuware_textshot",
+  "sectionCount": 1,
+  "pageCount": 2,
+  "text": "FICHA DE INTERVENÇÃO\nTicket Nº: 962759-1310691\nTécnico: Cudivila Fernando...",
+  "textLength": 1250,
+  "originalTextLength": 1250,
+  "truncated": false,
+  "status": "completed",
+  "processingTimeMs": 385,
+  "timings": {
+    "authTimeMs": 0,
+    "metadataTimeMs": 140,
+    "textshotTimeMs": 245,
+    "totalTimeMs": 385
+  },
+  "pages": [
+    {
+      "sectionId": "12345-sec-01",
+      "sectionIndex": 1,
+      "pageNumber": 1,
+      "globalPageNumber": 1,
+      "text": "FICHA DE INTERVENÇÃO\nTicket Nº: 962759-1310691...",
+      "textLength": 820,
+      "coordinatesAvailable": true
+    },
+    {
+      "sectionId": "12345-sec-01",
+      "sectionIndex": 1,
+      "pageNumber": 2,
+      "globalPageNumber": 2,
+      "text": "ANEXO FOTOGRÁFICO DO EQUIPAMENTO...",
+      "textLength": 430,
+      "coordinatesAvailable": true
+    }
+  ]
+}
+```
+
+### Códigos de Erro do Endpoint `/textshot`
+
+| Código | HTTP Status | Descrição |
+| :--- | :---: | :--- |
+| `INVALID_REQUEST` | `400` | `fileCabinetId` ou `documentId` ausentes/inválidos, ou opções malformadas. |
+| `DOCUWARE_AUTH_FAILED` | `401` / `500` | Falha na autenticação com a DocuWare Platform API ou credenciais ausentes no `.env`. |
+| `DOCUMENT_NOT_FOUND` | `404` / `403` | Documento não encontrado no armário informado ou sem permissão de leitura. |
+| `TEXTSHOT_NOT_AVAILABLE` | `422` | Documento existe, mas não possui Textshot disponível ou processado pelo DocuWare. |
+| `TEXT_TOO_LARGE` | `422` | Texto excede o limite operacional (`DOCUWARE_MAX_TEXTSHOT_CHARS`). |
+| `DOCUWARE_TIMEOUT` | `504` | Timeout ao comunicar com a DocuWare Platform API (`DOCUWARE_TIMEOUT_MS`). |
+| `DOCUWARE_API_ERROR` | `502` | Erro inesperado retornado pela DocuWare Platform API. |
+
+---
+
+## 3. Endpoint `POST /ai-gateway/extract` (Contrato JSON Dinâmico com IA)
+
+Recebe `multipart/form-data` com `file` (PDF) e `requestData` (JSON). Toda a configuração funcional da extração é definida dinamicamente pelo JSON:
 
 ```json
 {
@@ -56,8 +125,7 @@ No editor **HTTP Body** da atividade **Web Service** do DocuWare Workflow Design
       "Campo_Personalizado_1": {
         "type": "string",
         "description": "Descrição do campo 1",
-        "format": "dd/MM/yyyy",
-        "rule": "Regra específica deste campo"
+        "format": "dd/MM/yyyy"
       },
       "Campo_Personalizado_2": {
         "type": "string",
@@ -72,129 +140,33 @@ No editor **HTTP Body** da atividade **Web Service** do DocuWare Workflow Design
 }
 ```
 
-### Especificação das Seções do Contrato
-
-| Bloco | Obrigatório | Descrição |
-| :--- | :---: | :--- |
-| `provider` | Opcional | Provedor habilitado no servidor: `"openai"` (padrão), `"gemini"` ou `"openai_compatible"`. |
-| `model` | Opcional | Modelo do provedor (ex.: `"gpt-4o"`, `"gpt-4o-mini"`, `"gemini-2.5-flash"`). |
-| `processing` | Opcional | Parâmetros técnicos de execução (`strategy`, `temperature`, `max_output_tokens`, `timeout_ms`). |
-| `instructions` | **Sim** | Contém `prompt` (**obrigatório**), `system` (opcional) e `rules` (lista opcional de regras encaminhadas integralmente ao modelo). |
-| `extraction` | **Sim** | Contém `fields` (**obrigatório**, com pelo menos 1 campo). Aceita objeto `{ "NomeCampo": { "type": "string", ... } }` ou lista `[{ "name": "NomeCampo", "type": "string", ... }]`. |
-| `response` | Opcional | Define `strict` (`true`) e `null_handling` (`"empty_string"` padrão, `"type_default"` ou `"preserve_null"`). |
-
 ---
 
-## 4. Adaptador Explícito de Compatibilidade Legada (v1)
+## 4. Variáveis de Ambiente (`.env`)
 
-Para preservar fluxos já configurados anteriormente sem misturar os formatos, o módulo [`adaptLegacyRequestData`](src/schema-builder.ts) converte explicitamente requisições que utilizem exclusivamente as três chaves do formato anterior (`system_instruction`, `prompt`, `schema`):
+Consulte [`.env.example`](.env.example):
 
-```json
-{
-  "system_instruction": "Contexto opcional definido pelo workflow",
-  "prompt": "Instrução obrigatória definida pelo workflow",
-  "schema": {
-    "Campo_A": "Descrição do Campo A",
-    "Campo_B": "Descrição do Campo B"
-  }
-}
-```
-> **Nota:** Não é permitido misturar chaves do contrato canônico (`instructions`, `extraction`, `provider`, `processing`, `response`) com chaves do formato legado (`system_instruction`, `prompt`, `schema`) na mesma requisição.
+```env
+PORT=3014
+API_AUTH_TOKEN=docuware_token_2026
 
----
+# OpenAI (/ai-gateway/extract)
+OPENAI_API_KEY=sk-proj-...
+OPENAI_MODEL=gpt-4o
 
-## 5. Teste de Aceitação Obrigatório (Mesmo PDF, 3 Contratos Distintos)
-
-O script [`tests/curl-examples.sh`](tests/curl-examples.sh) executa o teste de aceitação enviando **o mesmo arquivo PDF três vezes** ao endpoint `https://wp.processcloud.app/ai-gateway/extract`:
-
-### 1ª Execução: Solicitando somente `Cliente` e `Telefone`
-```bash
-curl -s -X POST "https://wp.processcloud.app/ai-gateway/extract" \
-  -H "X-DocuWare-Token: docuware_token_2026" \
-  -F "file=@./documento.pdf;type=application/pdf" \
-  -F 'requestData={
-    "provider": "openai",
-    "model": "gpt-4o",
-    "instructions": {
-      "prompt": "Extraia apenas os dados solicitados nos campos abaixo."
-    },
-    "extraction": {
-      "fields": {
-        "Cliente": { "type": "string", "description": "Nome do cliente" },
-        "Telefone": { "type": "string", "description": "Telefone de contato" }
-      }
-    }
-  }'
-```
-**Resposta (exclusivamente os 2 campos solicitados):**
-```json
-{
-  "Cliente": "...",
-  "Telefone": "..."
-}
-```
-
-### 2ª Execução (Mesmo PDF): Solicitando somente `N_Ticket`, `Tecnico` e `Numero_Serie`
-```bash
-curl -s -X POST "https://wp.processcloud.app/ai-gateway/extract" \
-  -H "X-DocuWare-Token: docuware_token_2026" \
-  -F "file=@./documento.pdf;type=application/pdf" \
-  -F 'requestData={
-    "provider": "openai",
-    "model": "gpt-4o",
-    "instructions": {
-      "prompt": "Extraia apenas os identificadores solicitados nos campos abaixo."
-    },
-    "extraction": {
-      "fields": {
-        "N_Ticket": { "type": "string", "description": "Número do ticket" },
-        "Tecnico": { "type": "string", "description": "Nome do técnico" },
-        "Numero_Serie": { "type": "string", "description": "Número de série" }
-      }
-    }
-  }'
-```
-**Resposta (exclusivamente os 3 campos solicitados):**
-```json
-{
-  "N_Ticket": "...",
-  "Tecnico": "...",
-  "Numero_Serie": "..."
-}
-```
-
-### 3ª Execução (Mesmo PDF): Solicitando somente `Campo_A`, `Campo_B` e `Campo_C`
-```bash
-curl -s -X POST "https://wp.processcloud.app/ai-gateway/extract" \
-  -H "X-DocuWare-Token: docuware_token_2026" \
-  -F "file=@./documento.pdf;type=application/pdf" \
-  -F 'requestData={
-    "provider": "openai",
-    "model": "gpt-4o",
-    "instructions": {
-      "prompt": "Extraia os valores solicitados nas propriedades personalizadas abaixo."
-    },
-    "extraction": {
-      "fields": {
-        "Campo_A": { "type": "string", "description": "Primeira informação solicitada" },
-        "Campo_B": { "type": "string", "description": "Segunda informação solicitada" },
-        "Campo_C": { "type": "string", "description": "Terceira informação solicitada" }
-      }
-    }
-  }'
-```
-**Resposta (exclusivamente os 3 campos solicitados):**
-```json
-{
-  "Campo_A": "...",
-  "Campo_B": "...",
-  "Campo_C": "..."
-}
+# DocuWare Platform REST API (/ai-gateway/textshot)
+DOCUWARE_PLATFORM_URL=https://rcsangola.docuware.cloud/DocuWare/Platform
+DOCUWARE_USERNAME=seu_usuario_docuware
+DOCUWARE_PASSWORD=sua_senha_docuware
+DOCUWARE_BEARER_TOKEN=
+DOCUWARE_TIMEOUT_MS=30000
+DOCUWARE_MAX_CONCURRENCY=5
+DOCUWARE_MAX_TEXTSHOT_CHARS=2000000
 ```
 
 ---
 
-## 6. Estrutura do Repositório e CI/CD
+## 5. Estrutura do Repositório
 
 ```text
 .
@@ -203,19 +175,22 @@ curl -s -X POST "https://wp.processcloud.app/ai-gateway/extract" \
 ├── scripts/
 │   └── configure-nginx.sh     # Script idempotente que configura /ai-gateway/ no portal_nginx
 ├── src/
-│   ├── server.ts              # Inicialização Fastify, limites multipart e handler global
-│   ├── config.ts              # Credenciais e configurações protegidas por variáveis de ambiente (.env)
-│   ├── types.ts               # Contrato Canônico v2, Adaptador Legado v1 e tipos de validação
+│   ├── server.ts              # Inicialização Fastify e registro das rotas (/health, /extract, /textshot)
+│   ├── config.ts              # Configurações tipadas lidas de variáveis de ambiente (.env)
+│   ├── types.ts               # Contratos TypeScript para /extract e /textshot
 │   ├── auth.ts                # Autenticação time-safe (X-DocuWare-Token ou Authorization: Bearer)
-│   ├── schema-builder.ts      # Validador de contrato, gerador dinâmico de JSON Schema e filtro estrito de saída
+│   ├── docuware-client.ts     # Cliente DocuWare Platform API (cache de sessão, seções, Textshot e truncamento)
+│   ├── schema-builder.ts      # Validador de contrato JSON, JSON Schema dinâmico e filtro estrito de saída
 │   ├── openai-service.ts      # Dispatcher multi-provider (OpenAI / Gemini / Compatible) com retry exponencial
 │   ├── routes/
 │   │   ├── extract.ts         # Endpoints POST (/ai-gateway/extract, /extract, /api/extract, /)
+│   │   ├── textshot.ts        # Endpoints POST (/ai-gateway/textshot, /textshot, /api/textshot)
 │   │   └── health.ts          # Endpoints GET (/ai-gateway/health, /health)
 │   └── tests/
-│       └── gateway.test.ts    # Suíte de testes unitários e teste de aceitação das 3 execuções
+│       ├── gateway.test.ts    # Testes unitários e de aceitação do endpoint /extract
+│       └── textshot.test.ts   # Testes automatizados dos 6 cenários obrigatórios do endpoint /textshot
 ├── tests/
-│   └── curl-examples.sh       # Script executável com o Teste de Aceitação Obrigatório (3 execuções no mesmo PDF)
+│   └── curl-examples.sh       # Exemplos executáveis de chamadas curl para /extract e /textshot
 ├── Dockerfile
 ├── docker-compose.yml
 ├── .env.example

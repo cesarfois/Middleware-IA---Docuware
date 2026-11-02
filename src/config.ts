@@ -25,12 +25,25 @@ export interface AppConfig {
   openaiTimeoutMs: number;
   openaiMaxRetries: number;
   maxFileSizeBytes: number;
+  // Configurações da DocuWare Platform REST API (Endpoint Textshot)
+  docuwarePlatformUrl: string;
+  docuwareUsername: string;
+  docuwarePassword: string;
+  docuwareBearerToken: string;
+  docuwareHostId: string;
+  docuwareTimeoutMs: number;
+  docuwareMaxConcurrency: number;
+  docuwareMaxTextshotChars: number;
 }
 
 function parsePositiveInt(value: string | undefined, fallback: number): number {
   if (!value) return fallback;
   const parsed = Number.parseInt(value, 10);
   return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+function normalizeBaseUrl(url: string): string {
+  return url.trim().replace(/\/+$/, '');
 }
 
 export const config: AppConfig = {
@@ -53,4 +66,26 @@ export const config: AppConfig = {
   openaiMaxRetries: parsePositiveInt(process.env.OPENAI_MAX_RETRIES, 2),
   // Padrão: 30 MB (31.457.280 bytes)
   maxFileSizeBytes: parsePositiveInt(process.env.MAX_FILE_SIZE, 30 * 1024 * 1024),
+  // DocuWare Cloud 7.14 Platform REST API
+  docuwarePlatformUrl: normalizeBaseUrl(
+    process.env.DOCUWARE_PLATFORM_URL ||
+      'https://rcsangola.docuware.cloud/DocuWare/Platform'
+  ),
+  docuwareUsername: (process.env.DOCUWARE_USERNAME || '').trim(),
+  docuwarePassword: (process.env.DOCUWARE_PASSWORD || '').trim(),
+  docuwareBearerToken: (
+    process.env.DOCUWARE_BEARER_TOKEN ||
+    process.env.DOCUWARE_API_KEY ||
+    ''
+  ).trim(),
+  docuwareHostId: (process.env.DOCUWARE_HOST_ID || '').trim(),
+  docuwareTimeoutMs: parsePositiveInt(process.env.DOCUWARE_TIMEOUT_MS, 30000),
+  docuwareMaxConcurrency: parsePositiveInt(
+    process.env.DOCUWARE_MAX_CONCURRENCY,
+    5
+  ),
+  docuwareMaxTextshotChars: parsePositiveInt(
+    process.env.DOCUWARE_MAX_TEXTSHOT_CHARS,
+    2_000_000
+  ),
 };
