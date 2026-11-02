@@ -371,17 +371,17 @@ export function extractPageContentFromDocuWarePayload(
               : undefined;
 
     const hasChildContainers =
-      'Words' in obj ||
-      'Wd' in obj ||
-      'W' in obj ||
-      'Lines' in obj ||
-      'Ln' in obj ||
-      'L' in obj ||
-      'Paragraphs' in obj ||
-      'P' in obj ||
-      'Zones' in obj ||
-      'TextZones' in obj ||
-      'Items' in obj;
+      Array.isArray(obj.Words) ||
+      Array.isArray(obj.Wd) ||
+      Array.isArray(obj.W) ||
+      Array.isArray(obj.Lines) ||
+      Array.isArray(obj.Ln) ||
+      Array.isArray(obj.L) ||
+      Array.isArray(obj.Paragraphs) ||
+      Array.isArray(obj.P) ||
+      Array.isArray(obj.Zones) ||
+      Array.isArray(obj.TextZones) ||
+      Array.isArray(obj.Items);
 
     // Extrai coordenadas reais caso existam no próprio nó ou em sub-objeto Box/Rectangle
     const box =
@@ -482,7 +482,10 @@ export function extractPageContentFromDocuWarePayload(
     return [];
   }
 
-  visitNode(pageObj);
+  const rootParts = visitNode(pageObj);
+  if (rootParts.length > 0) {
+    linesText.push(rootParts.join(' '));
+  }
 
   const rawJoined = linesText.join('\n');
   return {
@@ -714,9 +717,12 @@ export class DocuWarePlatformClient {
       );
     }
 
+    const headersWithSetCookie = logonResp.headers as unknown as {
+      getSetCookie?: () => string[];
+    };
     const setCookies =
-      typeof logonResp.headers.getSetCookie === 'function'
-        ? logonResp.headers.getSetCookie()
+      typeof headersWithSetCookie.getSetCookie === 'function'
+        ? headersWithSetCookie.getSetCookie()
         : logonResp.headers.get('set-cookie')
           ? [logonResp.headers.get('set-cookie') as string]
           : [];
