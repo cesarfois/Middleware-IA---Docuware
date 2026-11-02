@@ -3,12 +3,13 @@
 # EXEMPLOS DE TESTE COM CURL - GATEWAY UNIVERSAL DOCUWARE <-> OPENAI GPT-4o
 # ============================================================================
 
-GATEWAY_URL="${GATEWAY_URL:-http://localhost:3000/extract}"
-API_TOKEN="${API_AUTH_TOKEN:-dw_prod_secret_token_change_me_9f8a7b6c5d4e3f2a1b}"
+GATEWAY_URL="${GATEWAY_URL:-http://wp.processcloud.app/ai-gateway/extract}"
+HEALTH_URL="${HEALTH_URL:-http://wp.processcloud.app/ai-gateway/health}"
+API_TOKEN="${API_AUTH_TOKEN:-docuware_token_2026}"
 SAMPLE_PDF="${SAMPLE_PDF:-./sample.pdf}"
 
 echo "=== 0. Verificando Healthcheck ==="
-curl -s "http://localhost:3000/health" | jq .
+curl -s "$HEALTH_URL" | jq .
 
 echo -e "\n=== Cenário A: Contrato (Partes, Vigência, Valor e Foro) ==="
 curl -s -X POST "$GATEWAY_URL" \
