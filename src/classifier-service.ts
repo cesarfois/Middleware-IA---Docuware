@@ -318,43 +318,17 @@ export class ClassifierService {
     }
 
     // Recupera o Textshot do DocuWare (sem truncar a 2000 caracteres; usa o limite próprio do classificador)
-    let textshotResult;
-    try {
-      textshotResult = await this.dwClient.retrieveDocumentTextshot({
-        fileCabinetId: req.fileCabinetId,
-        documentId: req.documentId,
-        options: {
-          includePages: true,
-          includeCoordinates: false,
-          normalize: true,
-          output: 'text',
-          maxCharacters: config.classifierMaxFeatureChars,
-        },
-      });
-    } catch (err) {
-      if (err instanceof DocuWareServiceError && err.code === 'TEXTSHOT_EMPTY') {
-        return {
-          success: true,
-          status: 'needs_review',
-          documentId: req.documentId,
-          fileCabinetId: req.fileCabinetId,
-          classification: {
-            documentType: null,
-            confidence: 0,
-            requiresManualReview: true,
-            secondBestDocumentType: null,
-            secondBestConfidence: null,
-          },
-          model: {
-            version: activeModel.version,
-          },
-          processingTimeMs: Date.now() - startTime,
-          message:
-            'Texto OCR vazio no DocuWare. Encaminhado para revisão manual.',
-        };
-      }
-      throw err;
-    }
+    const textshotResult = await this.dwClient.retrieveDocumentTextshot({
+      fileCabinetId: req.fileCabinetId,
+      documentId: req.documentId,
+      options: {
+        includePages: true,
+        includeCoordinates: false,
+        normalize: true,
+        output: 'text',
+        maxCharacters: config.classifierMaxFeatureChars,
+      },
+    });
 
     const featureText = this.extractFeatureTextFromTextshot(
       textshotResult.text,
@@ -677,7 +651,7 @@ export class ClassifierService {
       }
     }
 
-    // Se todas as tentativas falharam ou o erro for permanente (ex: 404 DOCUMENT_NOT_FOUND ou TEXTSHOT_EMPTY)
+    // Se todas as tentativas falharam ou o erro for permanente (ex: 404 DOCUMENT_NOT_FOUND)
     const errCode =
       lastError instanceof DocuWareServiceError
         ? lastError.code
@@ -687,12 +661,8 @@ export class ClassifierService {
         ? lastError.message
         : 'Erro inesperado durante o processamento do documento para aprendizagem.';
 
-    // Se o Textshot estava completamente vazio no DocuWare, classificamos como rejected
-    const finalStatus =
-      errCode === 'TEXTSHOT_EMPTY' ? 'rejected' : 'failed';
-
     this.store.updateTrainingJob(trainingId, {
-      status: finalStatus,
+      status: 'failed',
       exampleStored: false,
       includedInModel: false,
       errorCode: errCode,
@@ -705,7 +675,7 @@ export class ClassifierService {
       trainingId,
       fileCabinetId: job.fileCabinetId,
       documentId: job.documentId,
-      eventType: finalStatus === 'rejected' ? 'job_rejected' : 'job_error',
+      eventType: 'job_error',
       errorCode: errCode,
       message: errMsg,
     });
