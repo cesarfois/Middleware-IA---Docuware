@@ -31,18 +31,25 @@ jobs:
 
             echo "=== 3. Construindo nova imagem e recriando container de forma limpa ==="
             docker network create reverse-proxy-network 2>/dev/null || true
-            docker network connect reverse-proxy-network portal_nginx 2>/dev/null || true
             docker compose build
             docker compose down --remove-orphans 2>/dev/null || true
             docker rm -f docuware-ai-gateway 2>/dev/null || true
             docker compose up -d
 
-            echo "=== 4. Limpando imagens antigas sem uso ==="
+            echo "=== 4. Configurando rota /ai-gateway/ no portal_nginx ==="
+            sed -i 's/\r$//' scripts/configure-nginx.sh
+            bash scripts/configure-nginx.sh
+
+            echo "=== 5. Limpando imagens antigas sem uso ==="
             docker image prune -f
 
-            echo "=== 5. Validando Healthcheck ==="
+            echo "=== 6. Validando Healthcheck Direto e via Nginx ==="
             sleep 3
             PORT_VAL=$(grep -E '^PORT=' .env | cut -d '=' -f2 | tr -d '\r' || echo "3014")
+            echo -n "Direto (porta ${PORT_VAL:-3014}): "
             curl --fail -s "http://localhost:${PORT_VAL:-3014}/health"
+            echo ""
+            echo -n "Via Nginx (wp.processcloud.app/ai-gateway/health): "
+            curl -s -H "Host: wp.processcloud.app" "http://localhost/ai-gateway/health" || true
             echo ""
             echo "=== Deploy concluído com sucesso! ==="
