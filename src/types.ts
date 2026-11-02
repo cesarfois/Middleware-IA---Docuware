@@ -191,6 +191,133 @@ export interface TextshotResponse {
   pages?: TextshotPageResult[];
 }
 
+// ============================================================================
+// TIPOS DO SISTEMA DE CLASSIFICAÇÃO E APRENDIZAGEM LOCAL (/train, /classify)
+// ============================================================================
+
+export type TrainingJobStatus =
+  | 'queued'
+  | 'processing'
+  | 'stored'
+  | 'learned'
+  | 'rejected'
+  | 'failed';
+
+export type CategoryStatus = 'pending_validation' | 'active';
+
+export type ClassifierErrorCode =
+  | 'INVALID_REQUEST'
+  | 'TRAINING_JOB_NOT_FOUND'
+  | 'MODEL_NOT_READY'
+  | 'INSUFFICIENT_OCR_TEXT'
+  | 'CLASSIFICATION_FAILED';
+
+export interface TrainRequestBody {
+  fileCabinetId?: unknown;
+  documentId?: unknown;
+  documentType?: unknown;
+}
+
+export interface NormalizedTrainRequest {
+  fileCabinetId: string;
+  documentId: number;
+  documentTypeDisplay: string;
+  categoryKey: string;
+}
+
+export interface TrainImmediateResponse {
+  success: true;
+  trainingId: string;
+  documentId: number;
+  fileCabinetId: string;
+  documentType: string;
+  status: TrainingJobStatus;
+  message: string;
+}
+
+export interface TrainStatusResponse {
+  success: true;
+  trainingId: string;
+  status: TrainingJobStatus;
+  documentId: number;
+  fileCabinetId: string;
+  documentType: string;
+  category: {
+    status: CategoryStatus;
+    examplesReceived: number;
+    minimumExamples: number;
+    active: boolean;
+  };
+  model: {
+    version: string | null;
+    validationAccuracy: number | null;
+  };
+  details: {
+    textshotRetrieved: boolean;
+    exampleStored: boolean;
+    includedInModel: boolean;
+    wasCorrection: boolean;
+    previousDocumentType: string | null;
+    attempts: number;
+    errorCode: string | null;
+    errorMessage: string | null;
+    createdAt: string;
+    updatedAt: string;
+    completedAt: string | null;
+  };
+  message: string;
+}
+
+export interface ClassifyRequestBody {
+  fileCabinetId?: unknown;
+  documentId?: unknown;
+}
+
+export interface NormalizedClassifyRequest {
+  fileCabinetId: string;
+  documentId: number;
+}
+
+export interface ClassifyResponse {
+  success: true;
+  status: 'classified' | 'needs_review';
+  documentId: number;
+  fileCabinetId: string;
+  classification: {
+    documentType: string | null;
+    confidence: number;
+    requiresManualReview: boolean;
+    secondBestDocumentType?: string | null;
+    secondBestConfidence?: number | null;
+  };
+  model: {
+    version: string;
+  };
+  processingTimeMs: number;
+  message?: string;
+}
+
+export interface CategoryMetricsReport {
+  categoryKey: string;
+  displayName: string;
+  support: number;
+  precision: number;
+  recall: number;
+  f1Score: number;
+}
+
+export interface ModelValidationReport {
+  accuracy: number;
+  macroF1: number;
+  manualReviewRate: number;
+  perCategory: Record<string, CategoryMetricsReport>;
+  confusionMatrix: {
+    labels: string[];
+    matrix: number[][];
+  };
+  engine: 'python_sklearn' | 'node_tfidf_logreg';
+}
+
 /**
  * Payload de erro padronizado para retorno ao DocuWare.
  */
@@ -206,6 +333,7 @@ export interface StandardErrorResponse {
     | 'PROVIDER_NOT_AVAILABLE'
     | 'EXTRACTION_FAILED'
     | 'INTERNAL_ERROR'
-    | TextshotErrorCode;
+    | TextshotErrorCode
+    | ClassifierErrorCode;
   message: string;
 }

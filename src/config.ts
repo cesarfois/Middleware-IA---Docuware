@@ -1,4 +1,5 @@
 import dotenv from 'dotenv';
+import path from 'node:path';
 
 dotenv.config();
 
@@ -34,6 +35,21 @@ export interface AppConfig {
   docuwareTimeoutMs: number;
   docuwareMaxConcurrency: number;
   docuwareMaxTextshotChars: number;
+  // Configurações do Classificador Local Supervisionado (/train, /train/status, /classify)
+  classifierDataDir: string;
+  classifierDbPath: string;
+  classifierMinExamplesPerCategory: number;
+  classifierMinTextChars: number;
+  classifierMaxFeatureChars: number;
+  classifierMaxFeaturePages: number;
+  classifierMinConfidence: number;
+  classifierMinMargin: number;
+  classifierMinValidationF1: number;
+  classifierMaxRegressionDrop: number;
+  classifierMaxJobAttempts: number;
+  classifierJobRetryDelayMs: number;
+  classifierWorkerConcurrency: number;
+  classifierUsePythonEngine: boolean;
 }
 
 function parsePositiveInt(value: string | undefined, fallback: number): number {
@@ -42,9 +58,24 @@ function parsePositiveInt(value: string | undefined, fallback: number): number {
   return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
 }
 
+function parseFloatInRange(
+  value: string | undefined,
+  fallback: number,
+  min: number,
+  max: number
+): number {
+  if (!value) return fallback;
+  const parsed = Number.parseFloat(value);
+  return Number.isFinite(parsed) && parsed >= min && parsed <= max
+    ? parsed
+    : fallback;
+}
+
 function normalizeBaseUrl(url: string): string {
   return url.trim().replace(/\/+$/, '');
 }
+
+const defaultDataDir = (process.env.CLASSIFIER_DATA_DIR || '').trim() || path.resolve(process.cwd(), 'data');
 
 export const config: AppConfig = {
   port: parsePositiveInt(process.env.PORT, 3000),
@@ -88,4 +119,64 @@ export const config: AppConfig = {
     process.env.DOCUWARE_MAX_TEXTSHOT_CHARS,
     2_000_000
   ),
+  // Classificador Local Supervisionado
+  classifierDataDir: defaultDataDir,
+  classifierDbPath:
+    (process.env.CLASSIFIER_DB_PATH || '').trim() ||
+    path.join(defaultDataDir, 'classifier.sqlite'),
+  classifierMinExamplesPerCategory: parsePositiveInt(
+    process.env.CLASSIFIER_MIN_EXAMPLES_PER_CATEGORY,
+    10
+  ),
+  classifierMinTextChars: parsePositiveInt(
+    process.env.CLASSIFIER_MIN_TEXT_CHARS,
+    30
+  ),
+  classifierMaxFeatureChars: parsePositiveInt(
+    process.env.CLASSIFIER_MAX_FEATURE_CHARS,
+    15000
+  ),
+  classifierMaxFeaturePages: parsePositiveInt(
+    process.env.CLASSIFIER_MAX_FEATURE_PAGES,
+    5
+  ),
+  classifierMinConfidence: parseFloatInRange(
+    process.env.CLASSIFIER_MIN_CONFIDENCE,
+    0.70,
+    0.1,
+    0.99
+  ),
+  classifierMinMargin: parseFloatInRange(
+    process.env.CLASSIFIER_MIN_MARGIN,
+    0.15,
+    0.0,
+    0.95
+  ),
+  classifierMinValidationF1: parseFloatInRange(
+    process.env.CLASSIFIER_MIN_VALIDATION_F1,
+    0.75,
+    0.1,
+    1.0
+  ),
+  classifierMaxRegressionDrop: parseFloatInRange(
+    process.env.CLASSIFIER_MAX_REGRESSION_DROP,
+    0.05,
+    0.0,
+    0.5
+  ),
+  classifierMaxJobAttempts: parsePositiveInt(
+    process.env.CLASSIFIER_MAX_JOB_ATTEMPTS,
+    3
+  ),
+  classifierJobRetryDelayMs: parsePositiveInt(
+    process.env.CLASSIFIER_JOB_RETRY_DELAY_MS,
+    500
+  ),
+  classifierWorkerConcurrency: parsePositiveInt(
+    process.env.CLASSIFIER_WORKER_CONCURRENCY,
+    2
+  ),
+  classifierUsePythonEngine:
+    (process.env.CLASSIFIER_USE_PYTHON_ENGINE || 'true').toLowerCase() !==
+    'false',
 };

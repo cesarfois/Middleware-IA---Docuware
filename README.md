@@ -197,7 +197,146 @@ O adaptador explícito [`adaptLegacyRequestData`](src/schema-builder.ts) preserv
 
 ---
 
-## 4. Configuração de Variáveis de Ambiente na VPS (`.env`)
+---
+
+## 4. Classificação Documental com Aprendizagem Automática Local (`/ai-gateway/train` e `/ai-gateway/classify`)
+
+O middleware inclui um **motor local de Machine Learning supervisionado** (TF-IDF de unigramas/bigramas + Regressão Logística Multinomial Balanceada com validação cruzada estratificada K-Fold e calibração por similaridade cosseno aos centróides), executado **100% localmente na VPS**, sem qualquer chamada à OpenAI, Gemini ou serviços pagos.
+
+### Regras de Aprendizagem e Ativação Progressiva
+
+- **Sem tipos documentais fixos no código:** as categorias são criadas exclusivamente pelos exemplos enviados ao endpoint `POST /ai-gateway/train`. O endpoint `POST /ai-gateway/classify` nunca cria novos tipos documentais.
+- **Mínimo de 10 exemplos válidos por categoria (`CLASSIFIER_MIN_EXAMPLES_PER_CATEGORY=10`):** enquanto uma categoria tiver entre 1 e 9 exemplos distintos, permanece em `status: "pending_validation"` e os seus exemplos ficam como `stored`.
+- **Treino e validação automáticos:** ao atingir 10 exemplos válidos (ou novos exemplos/correções posteriores), o motor executa automaticamente validação cruzada estratificada. A categoria só passa a `active` e os exemplos só passam a `learned` se o modelo for validado com sucesso (`F1 >= 0.75`).
+- **Partilha de conhecimento entre armários:** exemplos aprendidos nos armários A e B permitem classificar documentos no armário C. O `fileCabinetId` nunca é utilizado como variável de previsão do tipo documental.
+- **Deduplicação e correção supervisionada:**
+  - Reenviar o mesmo `fileCabinetId + documentId` com o mesmo `documentType` é idempotente e não inflaciona a contagem de exemplos.
+  - Reenviar o mesmo `fileCabinetId + documentId` com um `documentType` diferente atualiza o rótulo do exemplo, recalcula a contagem de ambas as categorias e dispara retreino automático.
+
+### 4.1. Endpoint de Aprendizagem — `POST /ai-gateway/train`
+
+Submete **um único documento** já armazenado no DocuWare para aprendizagem supervisionada assíncrona.
+
+```json
+{
+  "fileCabinetId": "44324259-b89d-4d00-9304-21772729a54a",
+  "documentId": 1010186,
+  "documentType": "Ficha de Intervenção"
+}
+```
+
+**Resposta imediata (`200 OK`):**
+
+```json
+{
+  "success": true,
+  "trainingId": "trn-000001",
+  "documentId": 1010186,
+  "fileCabinetId": "44324259-b89d-4d00-9304-21772729a54a",
+  "documentType": "Ficha de Intervenção",
+  "status": "queued",
+  "message": "Exemplo recebido e colocado em fila para aprendizagem."
+}
+```
+
+### 4.2. Endpoint de Consulta de Estado — `GET /ai-gateway/train/status?trainingId=trn-000001`
+
+Consulta o progresso e o resultado real do trabalho de aprendizagem (`queued`, `processing`, `stored`, `learned`, `rejected`, `failed`).
+
+```json
+{
+  "success": true,
+  "trainingId": "trn-000001",
+  "status": "learned",
+  "documentId": 1010186,
+  "fileCabinetId": "44324259-b89d-4d00-9304-21772729a54a",
+  "documentType": "Ficha de Intervenção",
+  "category": {
+    "status": "active",
+    "examplesReceived": 10,
+    "minimumExamples": 10,
+    "active": true
+  },
+  "model": {
+    "version": "v1.0.1",
+    "validationAccuracy": 0.94
+  },
+  "details": {
+    "textshotRetrieved": true,
+    "exampleStored": true,
+    "includedInModel": true,
+    "wasCorrection": false,
+    "previousDocumentType": null,
+    "attempts": 1,
+    "errorCode": null,
+    "errorMessage": null,
+    "createdAt": "2026-11-02T23:00:00.000Z",
+    "updatedAt": "2026-11-02T23:00:02.000Z",
+    "completedAt": "2026-11-02T23:00:02.000Z"
+  },
+  "message": "Exemplo aprendido com sucesso e incorporado na versão v1.0.1 do modelo (precisão de validação: 94.0%)."
+}
+```
+
+### 4.3. Endpoint de Classificação — `POST /ai-gateway/classify`
+
+Recupera o Textshot do documento no DocuWare e classifica-o localmente entre as categorias ativas.
+
+```json
+{
+  "fileCabinetId": "44324259-b89d-4d00-9304-21772729a54a",
+  "documentId": 1010186
+}
+```
+
+**Resposta quando classificado com confiança (`status: "classified"`):**
+
+```json
+{
+  "success": true,
+  "status": "classified",
+  "documentId": 1010186,
+  "fileCabinetId": "44324259-b89d-4d00-9304-21772729a54a",
+  "classification": {
+    "documentType": "Ficha de Intervenção",
+    "confidence": 0.93,
+    "requiresManualReview": false,
+    "secondBestDocumentType": "Contrato",
+    "secondBestConfidence": 0.04
+  },
+  "model": {
+    "version": "v1.0.1"
+  },
+  "processingTimeMs": 145
+}
+```
+
+**Resposta quando ambíguo ou sem confiança suficiente (`status: "needs_review"`):**
+
+```json
+{
+  "success": true,
+  "status": "needs_review",
+  "documentId": 1010186,
+  "fileCabinetId": "44324259-b89d-4d00-9304-21772729a54a",
+  "classification": {
+    "documentType": null,
+    "confidence": 0.48,
+    "requiresManualReview": true,
+    "secondBestDocumentType": "Nota de Crédito",
+    "secondBestConfidence": 0.41
+  },
+  "model": {
+    "version": "v1.0.1"
+  },
+  "processingTimeMs": 130,
+  "message": "Confiança insuficiente ou ambiguidade entre categorias. Encaminhado para revisão manual."
+}
+```
+
+---
+
+## 5. Configuração de Variáveis de Ambiente na VPS (`.env`)
 
 No arquivo `/app/middleware-ia-docuware/.env` da VPS Contabo (veja modelo em [`.env.example`](.env.example)):
 
@@ -215,7 +354,7 @@ OPENAI_MODEL=gpt-4o
 OPENAI_TIMEOUT_MS=45000
 OPENAI_MAX_RETRIES=2
 
-# DocuWare Cloud 7.14 Platform REST API (/ai-gateway/textshot)
+# DocuWare Cloud 7.14 Platform REST API (/ai-gateway/textshot, /train, /classify)
 DOCUWARE_PLATFORM_URL=https://rcsangola.docuware.cloud/DocuWare/Platform
 DOCUWARE_USERNAME=seu_usuario_docuware
 DOCUWARE_PASSWORD=sua_senha_docuware
@@ -225,38 +364,55 @@ DOCUWARE_TIMEOUT_MS=30000
 DOCUWARE_MAX_CONCURRENCY=5
 DOCUWARE_MAX_TEXTSHOT_CHARS=2000000
 
+# Classificador Local Supervisionado (/ai-gateway/train e /ai-gateway/classify)
+CLASSIFIER_DATA_DIR=/app/data
+CLASSIFIER_MIN_EXAMPLES_PER_CATEGORY=10
+CLASSIFIER_MIN_TEXT_CHARS=30
+CLASSIFIER_MAX_FEATURE_CHARS=15000
+CLASSIFIER_MAX_FEATURE_PAGES=5
+CLASSIFIER_MIN_CONFIDENCE=0.70
+CLASSIFIER_MIN_MARGIN=0.15
+CLASSIFIER_MIN_VALIDATION_F1=0.75
+
 MAX_FILE_SIZE=31457280
 ```
 
 ---
 
-## 5. Estrutura do Projeto e Deploy Contínuo (CI/CD)
+## 6. Estrutura do Projeto e Deploy Contínuo (CI/CD)
 
 ```text
 .
 ├── .github/workflows/
 │   └── deploy.yml             # Pipeline CI/CD GitHub Actions (deploy automático via SSH na Contabo)
+├── ml/
+│   └── classifier_engine.py   # Motor Python (scikit-learn TF-IDF + LogisticRegression + StratifiedKFold)
 ├── scripts/
 │   └── configure-nginx.sh     # Script idempotente que configura /ai-gateway/ no portal_nginx
 ├── src/
-│   ├── server.ts              # Inicialização Fastify e registro das rotas (/health, /extract, /textshot)
+│   ├── server.ts              # Inicialização Fastify e registro das rotas (/health, /extract, /textshot, /train, /classify)
 │   ├── config.ts              # Configurações tipadas lidas de variáveis de ambiente (.env)
-│   ├── types.ts               # Contratos TypeScript para /extract e /textshot
+│   ├── types.ts               # Contratos TypeScript para /extract, /textshot, /train e /classify
 │   ├── auth.ts                # Autenticação time-safe (X-DocuWare-Token ou Authorization: Bearer)
 │   ├── docuware-client.ts     # Cliente DocuWare Platform API (cache de sessão, seções, Textshot e truncamento)
+│   ├── ml-engine.ts           # Ponte para o motor ML local (Python scikit-learn + fallback nativo TF-IDF/LogReg)
+│   ├── classifier-store.ts    # Persistência transacional em disco (categorias, exemplos, fila, modelos e auditoria)
+│   ├── classifier-service.ts  # Fila assíncrona, deduplicação, correção supervisionada, treino e classificação
 │   ├── schema-builder.ts      # Validador de contrato JSON, JSON Schema dinâmico e filtro estrito de saída
 │   ├── openai-service.ts      # Dispatcher multi-provider (OpenAI / Gemini / Compatible) com retry exponencial
 │   ├── routes/
 │   │   ├── extract.ts         # Endpoints POST (/ai-gateway/extract, /extract, /api/extract, /)
 │   │   ├── textshot.ts        # Endpoints POST (/ai-gateway/textshot, /textshot, /api/textshot)
+│   │   ├── classifier.ts      # Endpoints POST /train, GET /train/status e POST /classify
 │   │   └── health.ts          # Endpoints GET (/ai-gateway/health, /health)
 │   └── tests/
 │       ├── gateway.test.ts    # Testes unitários e de aceitação do endpoint /extract (3 execuções no mesmo PDF)
-│       └── textshot.test.ts   # Testes automatizados dos 6 cenários obrigatórios do endpoint /textshot
+│       ├── textshot.test.ts   # Testes automatizados dos 6 cenários obrigatórios do endpoint /textshot
+│       └── classifier.test.ts # Testes automatizados dos 16 cenários obrigatórios de aprendizagem e classificação
 ├── tests/
-│   └── curl-examples.sh       # Exemplos executáveis de chamadas curl para /extract e /textshot
-├── Dockerfile                 # Multi-Stage Node 22 Alpine (executa npm run build && npm test no build)
-├── docker-compose.yml         # Configuração de produção na VPS Contabo
+│   └── curl-examples.sh       # Exemplos executáveis de chamadas curl
+├── Dockerfile                 # Multi-Stage Node 22 Alpine + Python3 scikit-learn (executa build + testes)
+├── docker-compose.yml         # Configuração de produção na VPS Contabo com volume persistente /app/data
 ├── .env.example
 ├── package.json
 └── tsconfig.json
@@ -264,5 +420,5 @@ MAX_FILE_SIZE=31457280
 
 Todo `git push` na branch `main` dispara automaticamente o workflow [`.github/workflows/deploy.yml`](.github/workflows/deploy.yml), que:
 1. Conecta via SSH na VPS Contabo e atualiza `/app/middleware-ia-docuware` preservando o `.env`.
-2. Compila o TypeScript e executa os testes automatizados (`gateway.test.ts` e `textshot.test.ts`) durante o `docker compose build`.
+2. Compila o TypeScript e executa os testes automatizados (`gateway.test.ts`, `textshot.test.ts` e `classifier.test.ts`) durante o `docker compose build`.
 3. Recria o container `docuware-ai-gateway`, garante a rota `/ai-gateway/` no `portal_nginx` e valida o `/health`.

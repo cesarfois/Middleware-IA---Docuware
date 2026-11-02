@@ -31,10 +31,20 @@ services:
       - DOCUWARE_TIMEOUT_MS=${DOCUWARE_TIMEOUT_MS:-30000}
       - DOCUWARE_MAX_CONCURRENCY=${DOCUWARE_MAX_CONCURRENCY:-5}
       - DOCUWARE_MAX_TEXTSHOT_CHARS=${DOCUWARE_MAX_TEXTSHOT_CHARS:-2000000}
+      - CLASSIFIER_DATA_DIR=${CLASSIFIER_DATA_DIR:-/app/data}
+      - CLASSIFIER_MIN_EXAMPLES_PER_CATEGORY=${CLASSIFIER_MIN_EXAMPLES_PER_CATEGORY:-10}
+      - CLASSIFIER_MIN_TEXT_CHARS=${CLASSIFIER_MIN_TEXT_CHARS:-30}
+      - CLASSIFIER_MAX_FEATURE_CHARS=${CLASSIFIER_MAX_FEATURE_CHARS:-15000}
+      - CLASSIFIER_MAX_FEATURE_PAGES=${CLASSIFIER_MAX_FEATURE_PAGES:-5}
+      - CLASSIFIER_MIN_CONFIDENCE=${CLASSIFIER_MIN_CONFIDENCE:-0.70}
+      - CLASSIFIER_MIN_MARGIN=${CLASSIFIER_MIN_MARGIN:-0.15}
+      - CLASSIFIER_MIN_VALIDATION_F1=${CLASSIFIER_MIN_VALIDATION_F1:-0.75}
     expose:
       - "${PORT:-3014}"
     ports:
       - "${PORT:-3014}:${PORT:-3014}"
+    volumes:
+      - docuware_classifier_data:/app/data
     mem_limit: 1g
     cpus: 1.5
     security_opt:
@@ -44,6 +54,9 @@ services:
       - /tmp:size=64M,mode=1777
     networks:
       - default
+
+volumes:
+  docuware_classifier_data:
 
 networks:
   default:

@@ -4,11 +4,14 @@ import { config } from './config.js';
 import { registerHealthRoutes } from './routes/health.js';
 import { registerExtractRoutes } from './routes/extract.js';
 import { registerTextshotRoutes } from './routes/textshot.js';
+import { registerClassifierRoutes } from './routes/classifier.js';
 import type { DocuWarePlatformClient } from './docuware-client.js';
+import type { ClassifierService } from './classifier-service.js';
 import type { StandardErrorResponse } from './types.js';
 
 export interface BuildAppOptions {
   docuWareClient?: DocuWarePlatformClient;
+  classifierService?: ClassifierService;
 }
 
 export async function buildApp(
@@ -74,6 +77,7 @@ export async function buildApp(
   await registerHealthRoutes(app);
   await registerExtractRoutes(app);
   await registerTextshotRoutes(app, options.docuWareClient);
+  await registerClassifierRoutes(app, options.classifierService);
 
   return app;
 }

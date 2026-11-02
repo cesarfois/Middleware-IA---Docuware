@@ -11,8 +11,9 @@ COPY package*.json ./
 # Instala todas as dependências (incluindo devDependencies para o build)
 RUN npm install
 
-# Copia código-fonte e configuração TypeScript
+# Copia código-fonte, motor ML e configuração TypeScript
 COPY tsconfig.json ./
+COPY ml ./ml
 COPY src ./src
 
 # Compila TypeScript para JavaScript em ./dist e executa suíte de testes automatizados
@@ -28,13 +29,21 @@ FROM node:22-alpine AS runner
 
 WORKDIR /app
 
+# Instala Python 3 + scikit-learn para o motor local de classificação supervisionada
+# e cria o diretório persistente /app/data com permissões para o utilizador 'node'
+RUN apk add --no-cache python3 py3-scikit-learn && \
+    mkdir -p /app/data && \
+    chown -R node:node /app/data
+
 ENV NODE_ENV=production
 ENV PORT=3000
 ENV HOST=0.0.0.0
+ENV CLASSIFIER_DATA_DIR=/app/data
 
 # Ajusta permissões e executa sob o usuário não-root 'node' nativo do Alpine
 COPY --from=builder --chown=node:node /app/package*.json ./
 COPY --from=builder --chown=node:node /app/node_modules ./node_modules
+COPY --from=builder --chown=node:node /app/ml ./ml
 COPY --from=builder --chown=node:node /app/dist ./dist
 
 USER node
