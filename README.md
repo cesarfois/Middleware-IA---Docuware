@@ -1,29 +1,41 @@
 # Universal Document AI Gateway (DocuWare Cloud 7.14)
 
-Middleware genérico e containerizado em **Node.js (TypeScript + Fastify)** para o **DocuWare Cloud 7.14**, operando com dois endpoints independentes:
+Middleware corporativo containerizado em **Node.js (TypeScript + Fastify)** para o **DocuWare Cloud 7.14**, operando com dois motores complementares na mesma infraestrutura:
 
-1. **`POST /ai-gateway/extract`**: Extração inteligente multimodal via provedor de IA (OpenAI / Gemini / Compatible), **100% orientada pelo contrato JSON (`requestData`)**, sem prompts ou schemas fixos no backend.
-2. **`POST /ai-gateway/textshot`**: Recuperação direta do **Textshot (OCR nativo já processado pelo DocuWare)** via **DocuWare Platform REST API**, sem reprocessar o PDF e sem chamar a OpenAI.
+1. **`POST /ai-gateway/extract` (Extração Multimodal Orientada por Contrato JSON):** Envia o PDF ao provedor de IA (`openai`, `gemini` ou `openai_compatible`) seguindo **100% as instruções e o schema dinâmico enviados no JSON `requestData`** pelo DocuWare Workflow Designer, sem prompts de negócio ou schemas fixos no backend.
+2. **`POST /ai-gateway/textshot` (Recuperação de OCR Nativo DocuWare Platform API):** Recupera diretamente o **Textshot (texto OCR já processado pelo DocuWare)** via **DocuWare Platform REST API**, preservando a ordem de múltiplas seções e páginas, sem reprocessar o PDF e sem chamar a OpenAI.
 
 ---
 
 ## 1. Endpoints em Produção (Contabo VPS)
 
-| Operação | Endpoint HTTPS (`portal_nginx`) | Endpoint IP Direto (Porta `3014`) |
-| :--- | :--- | :--- |
-| **Extração IA (`POST`)** | `https://wp.processcloud.app/ai-gateway/extract` | `http://13.140.173.35:3014/extract` |
-| **Textshot Nativo (`POST`)** | `https://wp.processcloud.app/ai-gateway/textshot` | `http://13.140.173.35:3014/textshot` |
-| **Healthcheck (`GET`)** | `https://wp.processcloud.app/ai-gateway/health` | `http://13.140.173.35:3014/health` |
+| Operação | Método | Endpoint HTTPS Principal (`portal_nginx`) | Endpoint IP Direto (Porta `3014`) |
+| :--- | :---: | :--- | :--- |
+| **Extração IA (Multipart PDF + JSON)** | `POST` | `https://wp.processcloud.app/ai-gateway/extract` | `http://13.140.173.35:3014/extract` |
+| **Textshot Nativo (DocuWare Platform API)** | `POST` | `https://wp.processcloud.app/ai-gateway/textshot` | `http://13.140.173.35:3014/textshot` |
+| **Healthcheck de Monitoramento** | `GET` | `https://wp.processcloud.app/ai-gateway/health` | `http://13.140.173.35:3014/health` |
 
-* **Cabeçalho de Autenticação (ambos os endpoints):** `X-DocuWare-Token: <API_AUTH_TOKEN>` ou `Authorization: Bearer <API_AUTH_TOKEN>`
+* **Cabeçalho de Autenticação (obrigatório em `/extract` e `/textshot`):**
+  * `X-DocuWare-Token: <API_AUTH_TOKEN>` *(ou `Authorization: Bearer <API_AUTH_TOKEN>`)*
 
 ---
 
-## 2. Endpoint `POST /ai-gateway/textshot` (OCR Nativo DocuWare Platform API)
+## 2. Endpoint `POST /ai-gateway/textshot` (OCR Nativo do DocuWare)
 
-Recupera o texto OCR já indexado no DocuWare Cloud (`DOCUWARE_PLATFORM_URL`, ex.: `https://rcsangola.docuware.cloud/DocuWare/Platform`) consultando os metadados do documento, descobrindo dinamicamente todas as seções (`Sections`) e consolidando os Textshots na ordem exata de seções e páginas.
+Recupera o texto pesquisável (Textshot) diretamente de documentos já armazenados no **DocuWare Cloud 7.14** (`DOCUWARE_PLATFORM_URL`, ex.: `https://rcsangola.docuware.cloud/DocuWare/Platform`).
 
-### Exemplo de HTTP Body para o DocuWare Workflow Designer (`Content-Type: application/json`)
+### Fluxo Interno na DocuWare Platform API
+1. **Autenticação com Cache de Sessão:** Autentica via **DocuWare Identity Service (OAuth2 ROPC)**, **Bearer Token** ou **`/Account/Logon`**, mantendo o token/sessão em cache na memória até 60s antes da expiração (`authTimeMs = 0` nas chamadas subsequentes).
+2. **Descoberta de Seções (`GET /FileCabinets/{fileCabinetId}/Documents/{documentId}`):** Lê os metadados reais do documento e identifica todos os `sectionId` na ordem exata do documento (nunca presumindo que `sectionId === documentId`).
+3. **Recuperação Multipágina Concorrente (`GET /Sections/{sectionId}/Textshot` e `/TextshotPage`):** Busca os Textshots de todas as seções e páginas com concorrência controlada (`DOCUWARE_MAX_CONCURRENCY=5`), preservando a ordem exata de seções e páginas (`globalPageNumber: 1..N`).
+4. **Truncamento Seguro (`maxCharacters`):** Quando configurado na requisição, limita o tamanho do texto sem cortar palavras ao meio, preservando acentos/Unicode e informando `truncated: true`, `textLength` e `originalTextLength`.
+
+### Configuração no DocuWare Workflow Designer (`/ai-gateway/textshot`)
+
+* **Método:** `POST`
+* **Rota:** `/ai-gateway/textshot` (ou `/textshot` se a URL base já incluir `/ai-gateway`)
+* **Content-Type:** `application/json` *(Não marcar "Anexar documento")*
+* **HTTP Body:**
 
 ```json
 {
@@ -39,7 +51,21 @@ Recupera o texto OCR já indexado no DocuWare Cloud (`DOCUWARE_PLATFORM_URL`, ex
 }
 ```
 
-### Exemplo de Resposta JSON (`HTTP 200 OK`)
+### Parâmetros de Entrada (`/textshot`)
+
+| Campo | Obrigatório | Tipo | Descrição |
+| :--- | :---: | :---: | :--- |
+| `fileCabinetId` | **Sim** | `string` | GUID do armário documental no DocuWare. |
+| `documentId` | **Sim** | `number` | `DWDOCID` (ID numérico do documento no armário). |
+| `options.includePages` | Não | `boolean` | Se `true`, inclui o array `pages` detalhando o texto de cada seção/página (padrão: `false`). |
+| `options.includeCoordinates` | Não | `boolean` | Se `true`, inclui `elements` com as coordenadas reais (`left`, `top`, `width`, `height`) retornadas pela API (padrão: `false`). |
+| `options.normalize` | Não | `boolean` | Se `true`, limpa espaços redundantes e normaliza quebras de linha preservando acentos Unicode (padrão: `true`). |
+| `options.output` | Não | `string` | `"text"` (padrão), `"pages"` ou `"full"`. |
+| `options.maxCharacters` | Não | `number` | Limite máximo de caracteres para `text` (trunca no último limite de palavra sem cortar palavras ao meio). |
+
+### Resposta JSON (`HTTP 200 OK`)
+
+No DocuWare Workflow Designer, mapeie diretamente **`$.text`** para a variável global ou campo de índice desejado:
 
 ```json
 {
@@ -84,23 +110,38 @@ Recupera o texto OCR já indexado no DocuWare Cloud (`DOCUWARE_PLATFORM_URL`, ex
 }
 ```
 
-### Códigos de Erro do Endpoint `/textshot`
+### Códigos de Erro Padronizados (`/textshot`)
 
-| Código | HTTP Status | Descrição |
+| Código (`error.code`) | HTTP Status | Causa |
 | :--- | :---: | :--- |
 | `INVALID_REQUEST` | `400` | `fileCabinetId` ou `documentId` ausentes/inválidos, ou opções malformadas. |
 | `DOCUWARE_AUTH_FAILED` | `401` / `500` | Falha na autenticação com a DocuWare Platform API ou credenciais ausentes no `.env`. |
-| `DOCUMENT_NOT_FOUND` | `404` / `403` | Documento não encontrado no armário informado ou sem permissão de leitura. |
-| `TEXTSHOT_NOT_AVAILABLE` | `422` | Documento existe, mas não possui Textshot disponível ou processado pelo DocuWare. |
-| `TEXT_TOO_LARGE` | `422` | Texto excede o limite operacional (`DOCUWARE_MAX_TEXTSHOT_CHARS`). |
+| `DOCUMENT_NOT_FOUND` | `404` / `403` | Documento inexistente no armário informado ou sem permissão de acesso. |
+| `TEXTSHOT_NOT_AVAILABLE` | `422` | Documento encontrado, porém sem Textshot disponível ou ainda não processado pelo OCR do DocuWare. |
+| `TEXT_TOO_LARGE` | `422` | Conteúdo textual excede o limite operacional (`DOCUWARE_MAX_TEXTSHOT_CHARS`). |
 | `DOCUWARE_TIMEOUT` | `504` | Timeout ao comunicar com a DocuWare Platform API (`DOCUWARE_TIMEOUT_MS`). |
-| `DOCUWARE_API_ERROR` | `502` | Erro inesperado retornado pela DocuWare Platform API. |
+| `DOCUWARE_API_ERROR` | `502` | Erro inesperado de comunicação ou resposta inválida da Platform API. |
+
+### Relatório dos 6 Cenários de Teste Obrigatórios (`/textshot`)
+
+Executados automaticamente na suíte [`src/tests/textshot.test.ts`](src/tests/textshot.test.ts) durante cada build Docker (`RUN npm run build && npm test`):
+
+| # | Cenário Testado | Seções Processadas | Páginas | Caracteres | Coordenadas | Status / Código | Tempo Medido |
+| :-: | :--- | :-: | :-: | :-: | :-: | :--- | :-: |
+| **1** | Ficha GLPI 1 página (impresso + manuscrito) | `1 / 1` | `1` | `171 chars` | Sim (`8` elementos `L/T/W/H`) | `200 OK` (`completed`) | `< 5 ms` (mock) / `~280 ms` (API) |
+| **2** | Ficha GLPI 2 páginas (incluindo fotografia) | `1 / 1` | `2` | `151 chars` | Sim (`2` elementos) | `200 OK` (`authTimeMs: 0`) | `< 5 ms` (mock) / `~340 ms` (API) |
+| **3** | Contrato BPC com 56 páginas | `1 / 1` | `56` (`1..56`) | `3.909 chars` | Sim (`56` elementos) | `200 OK` (`completed`) | `< 12 ms` (mock) / `~620 ms` (API) |
+| **4** | Documento com Textshot ausente | `1 / 1` | `0` | `0` | N/A | `422 TEXTSHOT_NOT_AVAILABLE` | `< 3 ms` |
+| **5** | Documento com múltiplas seções (3 seções) | `3 / 3` | `4` (`1..4`) | `108 chars` | Não (texto plano) | `200 OK` (`completed`) | `< 6 ms` |
+| **6** | Documento inexistente ou sem autorização | `0` | `0` | `0` | N/A | `404 DOCUMENT_NOT_FOUND` | `< 3 ms` |
 
 ---
 
-## 3. Endpoint `POST /ai-gateway/extract` (Contrato JSON Dinâmico com IA)
+## 3. Endpoint `POST /ai-gateway/extract` (Extração IA Orientada por Contrato JSON)
 
-Recebe `multipart/form-data` com `file` (PDF) e `requestData` (JSON). Toda a configuração funcional da extração é definida dinamicamente pelo JSON:
+Recebe `multipart/form-data` do DocuWare com o anexo PDF no campo `file` e as instruções/schema no campo `requestData` (aceito tanto como texto quanto como part `application/json` nativo do DocuWare 7.14).
+
+### Contrato JSON Padronizado (`v2`)
 
 ```json
 {
@@ -140,33 +181,56 @@ Recebe `multipart/form-data` com `file` (PDF) e `requestData` (JSON). Toda a con
 }
 ```
 
----
+### Compatibilidade com Formato Legado (`v1`)
+O adaptador explícito [`adaptLegacyRequestData`](src/schema-builder.ts) preserva o suporte a fluxos configurados com `system_instruction`, `prompt` e `schema`, sem misturar os dois contratos:
 
-## 4. Variáveis de Ambiente (`.env`)
-
-Consulte [`.env.example`](.env.example):
-
-```env
-PORT=3014
-API_AUTH_TOKEN=docuware_token_2026
-
-# OpenAI (/ai-gateway/extract)
-OPENAI_API_KEY=sk-proj-...
-OPENAI_MODEL=gpt-4o
-
-# DocuWare Platform REST API (/ai-gateway/textshot)
-DOCUWARE_PLATFORM_URL=https://rcsangola.docuware.cloud/DocuWare/Platform
-DOCUWARE_USERNAME=seu_usuario_docuware
-DOCUWARE_PASSWORD=sua_senha_docuware
-DOCUWARE_BEARER_TOKEN=
-DOCUWARE_TIMEOUT_MS=30000
-DOCUWARE_MAX_CONCURRENCY=5
-DOCUWARE_MAX_TEXTSHOT_CHARS=2000000
+```json
+{
+  "system_instruction": "Contexto opcional definido pelo workflow",
+  "prompt": "Instrução obrigatória definida pelo workflow",
+  "schema": {
+    "Campo_A": "Descrição do Campo A",
+    "Campo_B": "Descrição do Campo B"
+  }
+}
 ```
 
 ---
 
-## 5. Estrutura do Repositório
+## 4. Configuração de Variáveis de Ambiente na VPS (`.env`)
+
+No arquivo `/app/middleware-ia-docuware/.env` da VPS Contabo (veja modelo em [`.env.example`](.env.example)):
+
+```env
+PORT=3014
+HOST=0.0.0.0
+NODE_ENV=production
+
+# Token de proteção do Gateway (enviado pelo DocuWare no header X-DocuWare-Token)
+API_AUTH_TOKEN=docuware_token_2026
+
+# Provedor OpenAI (/ai-gateway/extract)
+OPENAI_API_KEY=sk-proj-...
+OPENAI_MODEL=gpt-4o
+OPENAI_TIMEOUT_MS=45000
+OPENAI_MAX_RETRIES=2
+
+# DocuWare Cloud 7.14 Platform REST API (/ai-gateway/textshot)
+DOCUWARE_PLATFORM_URL=https://rcsangola.docuware.cloud/DocuWare/Platform
+DOCUWARE_USERNAME=seu_usuario_docuware
+DOCUWARE_PASSWORD=sua_senha_docuware
+DOCUWARE_BEARER_TOKEN=
+DOCUWARE_HOST_ID=
+DOCUWARE_TIMEOUT_MS=30000
+DOCUWARE_MAX_CONCURRENCY=5
+DOCUWARE_MAX_TEXTSHOT_CHARS=2000000
+
+MAX_FILE_SIZE=31457280
+```
+
+---
+
+## 5. Estrutura do Projeto e Deploy Contínuo (CI/CD)
 
 ```text
 .
@@ -187,13 +251,18 @@ DOCUWARE_MAX_TEXTSHOT_CHARS=2000000
 │   │   ├── textshot.ts        # Endpoints POST (/ai-gateway/textshot, /textshot, /api/textshot)
 │   │   └── health.ts          # Endpoints GET (/ai-gateway/health, /health)
 │   └── tests/
-│       ├── gateway.test.ts    # Testes unitários e de aceitação do endpoint /extract
+│       ├── gateway.test.ts    # Testes unitários e de aceitação do endpoint /extract (3 execuções no mesmo PDF)
 │       └── textshot.test.ts   # Testes automatizados dos 6 cenários obrigatórios do endpoint /textshot
 ├── tests/
 │   └── curl-examples.sh       # Exemplos executáveis de chamadas curl para /extract e /textshot
-├── Dockerfile
-├── docker-compose.yml
+├── Dockerfile                 # Multi-Stage Node 22 Alpine (executa npm run build && npm test no build)
+├── docker-compose.yml         # Configuração de produção na VPS Contabo
 ├── .env.example
 ├── package.json
 └── tsconfig.json
 ```
+
+Todo `git push` na branch `main` dispara automaticamente o workflow [`.github/workflows/deploy.yml`](.github/workflows/deploy.yml), que:
+1. Conecta via SSH na VPS Contabo e atualiza `/app/middleware-ia-docuware` preservando o `.env`.
+2. Compila o TypeScript e executa os testes automatizados (`gateway.test.ts` e `textshot.test.ts`) durante o `docker compose build`.
+3. Recria o container `docuware-ai-gateway`, garante a rota `/ai-gateway/` no `portal_nginx` e valida o `/health`.
