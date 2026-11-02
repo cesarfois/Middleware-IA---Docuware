@@ -119,3 +119,4 @@ export async function registerTextshotRoutes(
   app.post('/textshot', routeOptions, handleTextshotRequest);
   app.post('/api/textshot', routeOptions, handleTextshotRequest);
 }
+

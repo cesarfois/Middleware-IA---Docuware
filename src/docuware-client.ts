@@ -1298,3 +1298,4 @@ export class DocuWarePlatformClient {
 }
 
 export const defaultDocuWareClient = new DocuWarePlatformClient();
+
