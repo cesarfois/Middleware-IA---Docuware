@@ -9,6 +9,9 @@ set -e
 
 GATEWAY_URL="${GATEWAY_URL:-https://wp.processcloud.app/ai-gateway/extract}"
 TEXTSHOT_URL="${TEXTSHOT_URL:-https://wp.processcloud.app/ai-gateway/textshot}"
+TRAIN_URL="${TRAIN_URL:-https://wp.processcloud.app/ai-gateway/train}"
+TRAIN_STATUS_URL="${TRAIN_STATUS_URL:-https://wp.processcloud.app/ai-gateway/train/status}"
+CLASSIFY_URL="${CLASSIFY_URL:-https://wp.processcloud.app/ai-gateway/classify}"
 HEALTH_URL="${HEALTH_URL:-https://wp.processcloud.app/ai-gateway/health}"
 API_TOKEN="${API_AUTH_TOKEN:-docuware_token_2026}"
 SAMPLE_PDF="${SAMPLE_PDF:-/tmp/acceptance_sample.pdf}"
@@ -103,6 +106,33 @@ if [ -n "${DOCUWARE_CABINET_ID:-}" ] && [ -n "${DOCUWARE_DOCUMENT_ID:-}" ]; then
       }
     }"
   echo -e "\n"
+
+  echo "=== 5ª Execução (/train): Submetendo documento para aprendizagem supervisionada local ==="
+  TRAIN_RES=$(curl -s -X POST "$TRAIN_URL" \
+    -H "X-DocuWare-Token: $API_TOKEN" \
+    -H "Content-Type: application/json" \
+    -d "{
+      \"fileCabinetId\": \"${DOCUWARE_CABINET_ID}\",
+      \"documentId\": ${DOCUWARE_DOCUMENT_ID},
+      \"documentType\": \"${DOCUWARE_DOCUMENT_TYPE:-Ficha de Intervenção}\"
+    }")
+  echo "$TRAIN_RES"
+  echo -e "\n"
+
+  echo "=== 6ª Execução (/train/status): Consultando estado do trabalho de aprendizagem ==="
+  curl -s "${TRAIN_STATUS_URL}?trainingId=trn-000001" \
+    -H "X-DocuWare-Token: $API_TOKEN"
+  echo -e "\n"
+
+  echo "=== 7ª Execução (/classify): Classificando documento com o modelo local ==="
+  curl -s -X POST "$CLASSIFY_URL" \
+    -H "X-DocuWare-Token: $API_TOKEN" \
+    -H "Content-Type: application/json" \
+    -d "{
+      \"fileCabinetId\": \"${DOCUWARE_CABINET_ID}\",
+      \"documentId\": ${DOCUWARE_DOCUMENT_ID}
+    }"
+  echo -e "\n"
 else
-  echo "Para testar /textshot com um documento real, defina DOCUWARE_CABINET_ID e DOCUWARE_DOCUMENT_ID."
+  echo "Para testar /textshot, /train e /classify com um documento real, defina DOCUWARE_CABINET_ID e DOCUWARE_DOCUMENT_ID."
 fi

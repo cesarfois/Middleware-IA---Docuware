@@ -1,9 +1,10 @@
 # Universal Document AI Gateway (DocuWare Cloud 7.14)
 
-Middleware corporativo containerizado em **Node.js (TypeScript + Fastify)** para o **DocuWare Cloud 7.14**, operando com dois motores complementares na mesma infraestrutura:
+Middleware corporativo containerizado em **Node.js (TypeScript + Fastify)** para o **DocuWare Cloud 7.14**, operando com três motores complementares na mesma infraestrutura:
 
 1. **`POST /ai-gateway/extract` (Extração Multimodal Orientada por Contrato JSON):** Envia o PDF ao provedor de IA (`openai`, `gemini` ou `openai_compatible`) seguindo **100% as instruções e o schema dinâmico enviados no JSON `requestData`** pelo DocuWare Workflow Designer, sem prompts de negócio ou schemas fixos no backend.
 2. **`POST /ai-gateway/textshot` (Recuperação de OCR Nativo DocuWare Platform API):** Recupera diretamente o **Textshot (texto OCR já processado pelo DocuWare)** via **DocuWare Platform REST API**, preservando a ordem de múltiplas seções e páginas, sem reprocessar o PDF e sem chamar a OpenAI.
+3. **`POST /ai-gateway/train`, `GET /ai-gateway/train/status` e `POST /ai-gateway/classify` (Classificação Documental com Aprendizagem Automática Local):** Motor local de Machine Learning supervisionado (**TF-IDF de unigramas/bigramas + Regressão Logística Multinomial Balanceada + Validação Cruzada Estratificada 5-Fold + Calibração por Similaridade Cosseno aos Centróides**), executado **100% localmente na VPS**, sem qualquer chamada à OpenAI, Gemini ou serviços pagos.
 
 ---
 
@@ -13,9 +14,12 @@ Middleware corporativo containerizado em **Node.js (TypeScript + Fastify)** para
 | :--- | :---: | :--- | :--- |
 | **Extração IA (Multipart PDF + JSON)** | `POST` | `https://wp.processcloud.app/ai-gateway/extract` | `http://13.140.173.35:3014/extract` |
 | **Textshot Nativo (DocuWare Platform API)** | `POST` | `https://wp.processcloud.app/ai-gateway/textshot` | `http://13.140.173.35:3014/textshot` |
+| **Aprendizagem Supervisionada Local (1 doc)** | `POST` | `https://wp.processcloud.app/ai-gateway/train` | `http://13.140.173.35:3014/train` |
+| **Consulta de Estado da Aprendizagem** | `GET` | `https://wp.processcloud.app/ai-gateway/train/status` | `http://13.140.173.35:3014/train/status` |
+| **Classificação Automática Local** | `POST` | `https://wp.processcloud.app/ai-gateway/classify` | `http://13.140.173.35:3014/classify` |
 | **Healthcheck de Monitoramento** | `GET` | `https://wp.processcloud.app/ai-gateway/health` | `http://13.140.173.35:3014/health` |
 
-* **Cabeçalho de Autenticação (obrigatório em `/extract` e `/textshot`):**
+* **Cabeçalho de Autenticação (obrigatório em `/extract`, `/textshot`, `/train`, `/train/status` e `/classify`):**
   * `X-DocuWare-Token: <API_AUTH_TOKEN>` *(ou `Authorization: Bearer <API_AUTH_TOKEN>`)*
 
 ---
@@ -197,25 +201,34 @@ O adaptador explícito [`adaptLegacyRequestData`](src/schema-builder.ts) preserv
 
 ---
 
+## 4. Classificação Documental com Aprendizagem Automática Local (`/ai-gateway/train`, `/ai-gateway/train/status` e `/ai-gateway/classify`)
+
+O middleware inclui um **motor local de Machine Learning supervisionado** ([`src/ml-engine.ts`](src/ml-engine.ts), [`src/classifier-store.ts`](src/classifier-store.ts) e [`src/classifier-service.ts`](src/classifier-service.ts)) que utiliza **TF-IDF de unigramas e bigramas (`1..2`) com sublinear TF**, **Regressão Logística Multinomial Balanceada L2**, **Validação Cruzada Estratificada 5-Fold** e **calibração por similaridade cosseno aos centróides**. Todo o ciclo de aprendizagem e inferência ocorre **100% localmente na VPS**, sem qualquer chamada à OpenAI, Gemini ou serviços pagos.
+
+### Princípios e Regras Operacionais
+
+* **Sem tipos documentais fixos no código:** as categorias são criadas exclusivamente pelos exemplos enviados ao endpoint `POST /ai-gateway/train`. O endpoint `POST /ai-gateway/classify` **nunca** cria novos tipos documentais.
+* **Independência face ao excerto de 2.000 caracteres do `/textshot`:** para treino e classificação, o motor recupera até **5 páginas / 15.000 caracteres** (`CLASSIFIER_MAX_FEATURE_PAGES=5`, `CLASSIFIER_MAX_FEATURE_CHARS=15000`), mantendo o endpoint `/textshot` totalmente independente.
+* **Mínimo de 10 exemplos válidos por categoria (`CLASSIFIER_MIN_EXAMPLES_PER_CATEGORY=10`):**
+  * De **1 a 9 exemplos distintos**, a categoria permanece em `status: "pending_validation"` (`active: false`) e os exemplos permanecem em `status: "stored"` (nunca marcados prematuramente como `learned`).
+  * Ao atingir **10 exemplos válidos** (ou ao receber novos exemplos/correções posteriores), o serviço executa automaticamente o treino e a validação cruzada 5-fold em background.
+  * A categoria só passa a `status: "active"` e os exemplos/trabalhos só transitam para `status: "learned"` se o modelo cumprir a métrica mínima de validação (`F1 >= 0.75`, configurável em `CLASSIFIER_MIN_VALIDATION_F1`).
+* **Partilha de conhecimento entre armários:** exemplos aprendidos nos armários A e B permitem classificar documentos no armário C. O `fileCabinetId` é guardado apenas como metadado operacional para consulta do Textshot e **nunca** é usado como feature de previsão.
+* **Deduplicação e correção supervisionada (`fileCabinetId + documentId`):**
+  * Reenviar o mesmo documento com o **mesmo `documentType`** é **idempotente** e não inflaciona `examplesReceived`.
+  * Reenviar o mesmo documento com um **`documentType` diferente** é tratado como **correção supervisionada de rótulo** (`wasCorrection: true`), atualizando a categoria do exemplo, recalculando a contagem da categoria anterior e da nova, registando o evento no histórico de auditoria e disparando retreino automático.
+
 ---
-
-## 4. Classificação Documental com Aprendizagem Automática Local (`/ai-gateway/train` e `/ai-gateway/classify`)
-
-O middleware inclui um **motor local de Machine Learning supervisionado** (TF-IDF de unigramas/bigramas + Regressão Logística Multinomial Balanceada com validação cruzada estratificada K-Fold e calibração por similaridade cosseno aos centróides), executado **100% localmente na VPS**, sem qualquer chamada à OpenAI, Gemini ou serviços pagos.
-
-### Regras de Aprendizagem e Ativação Progressiva
-
-- **Sem tipos documentais fixos no código:** as categorias são criadas exclusivamente pelos exemplos enviados ao endpoint `POST /ai-gateway/train`. O endpoint `POST /ai-gateway/classify` nunca cria novos tipos documentais.
-- **Mínimo de 10 exemplos válidos por categoria (`CLASSIFIER_MIN_EXAMPLES_PER_CATEGORY=10`):** enquanto uma categoria tiver entre 1 e 9 exemplos distintos, permanece em `status: "pending_validation"` e os seus exemplos ficam como `stored`.
-- **Treino e validação automáticos:** ao atingir 10 exemplos válidos (ou novos exemplos/correções posteriores), o motor executa automaticamente validação cruzada estratificada. A categoria só passa a `active` e os exemplos só passam a `learned` se o modelo for validado com sucesso (`F1 >= 0.75`).
-- **Partilha de conhecimento entre armários:** exemplos aprendidos nos armários A e B permitem classificar documentos no armário C. O `fileCabinetId` nunca é utilizado como variável de previsão do tipo documental.
-- **Deduplicação e correção supervisionada:**
-  - Reenviar o mesmo `fileCabinetId + documentId` com o mesmo `documentType` é idempotente e não inflaciona a contagem de exemplos.
-  - Reenviar o mesmo `fileCabinetId + documentId` com um `documentType` diferente atualiza o rótulo do exemplo, recalcula a contagem de ambas as categorias e dispara retreino automático.
 
 ### 4.1. Endpoint de Aprendizagem — `POST /ai-gateway/train`
 
 Submete **um único documento** já armazenado no DocuWare para aprendizagem supervisionada assíncrona.
+
+* **Método:** `POST`
+* **Rota:** `/ai-gateway/train` (aliases: `/train`, `/api/train`)
+* **Content-Type:** `application/json` *(Não anexar ficheiro PDF)*
+
+#### Exemplo de Requisição (`/train`)
 
 ```json
 {
@@ -225,7 +238,13 @@ Submete **um único documento** já armazenado no DocuWare para aprendizagem sup
 }
 ```
 
-**Resposta imediata (`200 OK`):**
+| Campo | Obrigatório | Tipo | Descrição |
+| :--- | :---: | :---: | :--- |
+| `fileCabinetId` | **Sim** | `string` | GUID do armário onde o documento está arquivado no DocuWare. |
+| `documentId` | **Sim** | `number` | `DWDOCID` (ID numérico do documento no DocuWare). |
+| `documentType` | **Sim** | `string` | Tipo documental validado no workflow (ex.: `"Ficha de Intervenção"`, `"Contrato"`, `"Fatura"`, `"Nota de Crédito"`, `"Fatura de Adiantamento"`). |
+
+#### Resposta Imediata (`HTTP 200 OK`)
 
 ```json
 {
@@ -239,16 +258,71 @@ Submete **um único documento** já armazenado no DocuWare para aprendizagem sup
 }
 ```
 
-### 4.2. Endpoint de Consulta de Estado — `GET /ai-gateway/train/status?trainingId=trn-000001`
+---
 
-Consulta o progresso e o resultado real do trabalho de aprendizagem (`queued`, `processing`, `stored`, `learned`, `rejected`, `failed`).
+### 4.2. Endpoint de Consulta de Estado — `GET /ai-gateway/train/status`
+
+Permite ao DocuWare Workflow Designer ou à equipa técnica consultar o estado real do trabalho de aprendizagem.
+
+* **Método:** `GET`
+* **Rota:** `/ai-gateway/train/status?trainingId=trn-000001` (aliases: `/train/status`, `/api/train/status`)
+
+#### Estados Possíveis do Trabalho (`status`)
+
+| Estado | Significado |
+| :--- | :--- |
+| `queued` | Recebido e guardado na fila persistente para processamento assíncrono. |
+| `processing` | Worker em execução a recuperar o Textshot no DocuWare ou a treinar o modelo. |
+| `stored` | Textshot validado e exemplo guardado, aguardando que a categoria atinja o mínimo de 10 exemplos coerentes (`pending_validation`). |
+| `learned` | Exemplo incorporado numa versão treinada, validada e ativada do modelo (`category.status = "active"`). |
+| `rejected` | Documento rejeitado para treino por não possuir texto OCR suficiente (`INSUFFICIENT_OCR_TEXT`). Não incrementa a contagem da categoria. |
+| `failed` | Erro técnico ao consultar o DocuWare após todas as retentativas automáticas (ex.: `DOCUMENT_NOT_FOUND`, `TEXTSHOT_NOT_AVAILABLE`). |
+
+#### Exemplo de Resposta quando `stored` (1 a 9 exemplos — categoria em `pending_validation`)
 
 ```json
 {
   "success": true,
   "trainingId": "trn-000001",
-  "status": "learned",
+  "status": "stored",
   "documentId": 1010186,
+  "fileCabinetId": "44324259-b89d-4d00-9304-21772729a54a",
+  "documentType": "Ficha de Intervenção",
+  "category": {
+    "status": "pending_validation",
+    "examplesReceived": 4,
+    "minimumExamples": 10,
+    "active": false
+  },
+  "model": {
+    "version": null,
+    "validationAccuracy": null
+  },
+  "details": {
+    "textshotRetrieved": true,
+    "exampleStored": true,
+    "includedInModel": false,
+    "wasCorrection": false,
+    "previousDocumentType": null,
+    "attempts": 1,
+    "errorCode": null,
+    "errorMessage": null,
+    "createdAt": "2026-11-02T23:00:00.000Z",
+    "updatedAt": "2026-11-02T23:00:01.000Z",
+    "completedAt": "2026-11-02T23:00:01.000Z"
+  },
+  "message": "Exemplo válido guardado com sucesso (4/10 exemplos necessários para ativar a categoria \"Ficha de Intervenção\")."
+}
+```
+
+#### Exemplo de Resposta quando `learned` (>= 10 exemplos — categoria validada e `active`)
+
+```json
+{
+  "success": true,
+  "trainingId": "trn-000010",
+  "status": "learned",
+  "documentId": 1010195,
   "fileCabinetId": "44324259-b89d-4d00-9304-21772729a54a",
   "documentType": "Ficha de Intervenção",
   "category": {
@@ -270,17 +344,25 @@ Consulta o progresso e o resultado real do trabalho de aprendizagem (`queued`, `
     "attempts": 1,
     "errorCode": null,
     "errorMessage": null,
-    "createdAt": "2026-11-02T23:00:00.000Z",
-    "updatedAt": "2026-11-02T23:00:02.000Z",
-    "completedAt": "2026-11-02T23:00:02.000Z"
+    "createdAt": "2026-11-02T23:05:00.000Z",
+    "updatedAt": "2026-11-02T23:05:02.000Z",
+    "completedAt": "2026-11-02T23:05:02.000Z"
   },
   "message": "Exemplo aprendido com sucesso e incorporado na versão v1.0.1 do modelo (precisão de validação: 94.0%)."
 }
 ```
 
-### 4.3. Endpoint de Classificação — `POST /ai-gateway/classify`
+---
 
-Recupera o Textshot do documento no DocuWare e classifica-o localmente entre as categorias ativas.
+### 4.3. Endpoint de Classificação Automática — `POST /ai-gateway/classify`
+
+Recupera o Textshot do documento no DocuWare e classifica-o localmente utilizando exclusivamente as categorias `active` do modelo em vigor.
+
+* **Método:** `POST`
+* **Rota:** `/ai-gateway/classify` (aliases: `/classify`, `/api/classify`)
+* **Content-Type:** `application/json`
+
+#### Exemplo de Requisição (`/classify`)
 
 ```json
 {
@@ -289,7 +371,7 @@ Recupera o Textshot do documento no DocuWare e classifica-o localmente entre as 
 }
 ```
 
-**Resposta quando classificado com confiança (`status: "classified"`):**
+#### Resposta quando Classificado com Confiança (`status: "classified"`)
 
 ```json
 {
@@ -311,7 +393,9 @@ Recupera o Textshot do documento no DocuWare e classifica-o localmente entre as 
 }
 ```
 
-**Resposta quando ambíguo ou sem confiança suficiente (`status: "needs_review"`):**
+#### Resposta quando Ambíguo ou com Confiança Insuficiente (`status: "needs_review"`)
+
+Quando a confiança é inferior a `0.70` (`CLASSIFIER_MIN_CONFIDENCE`), a margem entre a 1.ª e a 2.ª categoria é inferior a `0.15` (`CLASSIFIER_MIN_MARGIN`), a similaridade ao centróide é baixa ou o texto OCR é insuficiente, o endpoint **não força uma classificação arriscada** e devolve `documentType: null` e `requiresManualReview: true`:
 
 ```json
 {
@@ -333,6 +417,51 @@ Recupera o Textshot do documento no DocuWare e classifica-o localmente entre as 
   "message": "Confiança insuficiente ou ambiguidade entre categorias. Encaminhado para revisão manual."
 }
 ```
+
+#### Mapeamento JSONPath Recomendado no DocuWare Workflow Designer (`/classify`)
+
+| JSONPath | Variável de Workflow Sugerida | Utilização no Workflow Designer |
+| :--- | :--- | :--- |
+| `$.status` | `GV_Status_Classificacao` | `"classified"` ou `"needs_review"`. |
+| `$.classification.documentType` | `GV_Tipo_Documental` | Gravar no campo de índice `TIPO_DOCUMENTO` apenas se `GV_Requer_Revisao == false`. |
+| `$.classification.confidence` | `GV_Confianca_ML` | Grau de confiança calibrado (`0` a `0.99`). |
+| `$.classification.requiresManualReview` | `GV_Requer_Revisao` | Booleano (`true`/`false`) para condição de decisão: se `true`, encaminhar para tarefa humana de revisão manual (que depois alimenta o `/train`). |
+| `$.model.version` | `GV_Versao_Modelo` | Versão do modelo que realizou a inferência (`v1.0.x`). |
+
+#### Códigos de Erro Padronizados (`/train`, `/train/status` e `/classify`)
+
+| Código (`error.code`) | HTTP Status | Causa |
+| :--- | :---: | :--- |
+| `INVALID_REQUEST` | `400` | Campos obrigatórios (`fileCabinetId`, `documentId`, `documentType` ou `trainingId`) ausentes ou inválidos. |
+| `TRAINING_JOB_NOT_FOUND` | `404` | `trainingId` informado em `/train/status` não existe. |
+| `MODEL_NOT_READY` | `422` | Chamada a `/classify` antes de existir pelo menos uma categoria ativa (`>= 10` exemplos validados). |
+| `DOCUMENT_NOT_FOUND` | `404` / `403` | Documento não encontrado no armário do DocuWare. |
+| `TEXTSHOT_NOT_AVAILABLE` | `422` | Documento ainda sem Textshot OCR disponível no DocuWare. |
+
+---
+
+### 4.4. Relatório dos 16 Cenários Obrigatórios de Aprendizagem e Classificação
+
+Validados automaticamente na suíte [`src/tests/classifier.test.ts`](src/tests/classifier.test.ts) durante cada build Docker:
+
+| # | Cenário Obrigatório | Resultado Validado |
+| :-: | :--- | :--- |
+| **1** | Enviar um único documento para `/train` e consultar `/train/status` | Retorna `queued` imediato (`trn-000001`) e transita para `stored` após extrair o Textshot. |
+| **2** | Reenviar o mesmo documento (`fileCabinetId + documentId`) com o mesmo tipo | Idempotente: não duplica o exemplo nem inflaciona `examplesReceived`. |
+| **3** | Reenviar o mesmo documento com tipo documental corrigido | `wasCorrection: true`, atualiza `previousDocumentType` e recalcula ambas as categorias. |
+| **4** | Enviar 1 a 9 exemplos de uma nova categoria | Categoria permanece em `pending_validation` (`active: false`) e exemplos em `stored`. |
+| **5** | Enviar o 10.º exemplo de uma categoria coerente | Dispara treino e validação K-Fold automáticos; categoria passa a `active` e exemplos a `learned`. |
+| **6** | Enviar 10 exemplos incoerentes/contraditórios de uma categoria | Reprova na validação cruzada (`F1 < 0.75`); categoria permanece em `pending_validation`. |
+| **7** | Enviar exemplos provenientes de dois armários diferentes para a mesma categoria | Exemplos de `fc-glpi-001` e `fc-manut-002` consolidam a mesma categoria documental. |
+| **8** | Classificar documento num terceiro armário (`fc-armario-terceiro-999`) | Classifica com sucesso usando o conhecimento adquirido nos outros armários. |
+| **9** | Classificar documento claro de `"Ficha de Intervenção"` | `status: "classified"`, `documentType: "Ficha de Intervenção"`, `requiresManualReview: false`. |
+| **10** | Classificar documento claro de `"Contrato"` | `status: "classified"`, `documentType: "Contrato"`, `requiresManualReview: false`. |
+| **11** | Distinguir entre `"Fatura"`, `"Nota de Crédito"` e `"Fatura de Adiantamento"` | Classifica cada um dos 3 tipos financeiros separadamente com alta confiança. |
+| **12** | Classificar documento ambíguo ou fora de domínio | Retorna `status: "needs_review"`, `documentType: null`, `requiresManualReview: true`. |
+| **13** | Classificar documento sem Textshot disponível | Retorna `422 TEXTSHOT_NOT_AVAILABLE` estruturado. |
+| **14** | Classificar documento inexistente no DocuWare | Retorna `404 DOCUMENT_NOT_FOUND` estruturado. |
+| **15** | Simular reinício do serviço com trabalhos `processing` na fila | `recoverAndResumeQueue()` recupera os trabalhos do disco (`/app/data`) e conclui a aprendizagem. |
+| **16** | Confirmar que `/extract` e `/textshot` (incluindo excerto de 2.000 chars) continuam operacionais | Ambos os contratos e rotas funcionam sem qualquer regressão. |
 
 ---
 
