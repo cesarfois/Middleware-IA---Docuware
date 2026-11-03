@@ -915,8 +915,9 @@ describe('Sistema de Aprendizagem Supervisionada e Classificação Automática L
       assert.equal(diag.candidateCategories.length, 4);
       assert.equal(diag.rejectionReasons.length, 0);
       assert.ok(diag.candidateValidation);
+      const candVal = diag.candidateValidation!;
 
-      const cm = diag.candidateValidation.confusionMatrix;
+      const cm = candVal.confusionMatrix;
       assert.equal(cm.labels.length, 4);
       assert.equal(cm.matrix.length, 4);
 
@@ -932,7 +933,7 @@ describe('Sistema de Aprendizagem Supervisionada e Classificação Automática L
 
       for (let c = 0; c < 4; c++) {
         const label = cm.labels[c]!;
-        const catMetrics = diag.candidateValidation.perCategory[label];
+        const catMetrics = candVal.perCategory[label];
         assert.ok(catMetrics, `Métricas ausentes para ${label}`);
 
         const tp = cm.matrix[c]![c]!;
