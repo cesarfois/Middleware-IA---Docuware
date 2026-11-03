@@ -206,7 +206,7 @@ O adaptador explícito [`adaptLegacyRequestData`](src/schema-builder.ts) preserv
 
 ## 4. Classificação Documental e Monitoramento ML Local (`/ai-gateway/train`, `/train/status`, `/train/summary`, `/train/history` e `/classify`)
 
-O middleware inclui um **motor local de Machine Learning supervisionado** ([`src/ml-engine.ts`](src/ml-engine.ts), [`src/classifier-store.ts`](src/classifier-store.ts) e [`src/classifier-service.ts`](src/classifier-service.ts)) que utiliza **TF-IDF de unigramas e bigramas (`1..2`) com sublinear TF**, **Regressão Logística Multinomial Balanceada L2**, **Validação Cruzada Estratificada 5-Fold** e **calibração por similaridade cosseno aos centróides**. Todo o ciclo de aprendizagem e inferência ocorre **100% localmente na VPS**, sem qualquer chamada à OpenAI, Gemini ou serviços pagos.
+O middleware inclui um **motor local de Machine Learning supervisionado** ([`src/ml-engine.ts`](src/ml-engine.ts), [`src/classifier-store.ts`](src/classifier-store.ts) e [`src/classifier-service.ts`](src/classifier-service.ts)) que utiliza **TF-IDF de n-gramas de palavras (unigramas, bigramas e trigramas, `1..3`) com sublinear TF e tokens de zona de cabeçalho (`hdr_`)**, **Regressão Logística Multinomial Balanceada L2**, **Validação Cruzada Estratificada por Grupo 5-Fold sem data leakage** e **calibração por similaridade cosseno aos centróides**. Todo o ciclo de aprendizagem e inferência ocorre **100% localmente na VPS**, sem qualquer chamada à OpenAI, Gemini ou serviços pagos.
 
 ### Princípios e Regras Operacionais
 
@@ -518,6 +518,12 @@ curl -s -X GET "https://wp.processcloud.app/ai-gateway/train/summary" \
 | `trainingDiagnostics` | `object` | Diagnóstico persistido da **última tentativa** de treino (aprovada ou rejeitada): `lastAttemptAt`, `candidateCategories`, `candidateExamples`, `candidateValidation` (`accuracy`, `macroF1`, `weightedF1`, `perCategory`, `confusionMatrix`), `activationApproved`, `rejectionReasons`, `activeModelVersionBeforeAttempt`, `activeModelVersionAfterAttempt`. |
 | `categories[].activation` | `object` | Motivo do estado da categoria: `eligible`, `includedInLastCandidate`, `lastAttemptStatus` (`approved`, `rejected`, `pending`, `not_evaluated`), `reasonCode`, `reasonMessage`, `candidatePrecision`, `candidateRecall`, `candidateF1`, `requiredF1`. |
 
+> [!NOTE]
+> **Distinção entre `completedJobs` e `learnedExamples`:**
+> - `summary.completedJobs`: total de chamadas a `/train` cujo processamento do documento e extração de Textshot foram concluídos com sucesso (`stored` ou `learned`).
+> - `summary.learnedExamples`: quantidade de documentos que foram **efetivamente aprendidos e incorporados** na versão ativa do modelo discriminativo.
+> - Se uma categoria já recebeu documentos mas ainda está pendente de validação discriminativa, os seus trabalhos estarão em `completedJobs` (`stored`), mas os seus exemplos só contarão em `learnedExamples` após validação e ativação da versão do modelo.
+
 #### Códigos `categories[].activation.reasonCode`
 
 | Código | Significado |
@@ -546,34 +552,168 @@ curl -s -X GET "https://wp.processcloud.app/ai-gateway/train/summary" \
 {
   "success": true,
   "model": {
-    "version": "v1.0.3",
+    "version": "v1.0.6",
     "status": "active",
     "engine": "node_tfidf_logreg",
-    "trainedAt": "2026-11-03T02:00:00.000Z",
-    "activatedAt": "2026-11-03T02:00:02.000Z",
+    "trainedAt": "2026-11-03T11:00:00.000Z",
+    "activatedAt": "2026-11-03T11:00:02.000Z",
     "validation": {
-      "accuracy": 0.94,
-      "macroF1": 0.91,
-      "weightedF1": 0.93
+      "accuracy": 0.9677,
+      "macroF1": 0.9682,
+      "weightedF1": 0.9685,
+      "confusionMatrix": {
+        "labels": [
+          "Factura",
+          "Factura Adiantamento",
+          "Factura Global",
+          "Ficha de Intervenção"
+        ],
+        "matrix": [
+          [20, 0, 0, 0],
+          [0, 16, 0, 0],
+          [0, 0, 12, 0],
+          [0, 0, 0, 14]
+        ]
+      }
     }
   },
   "summary": {
-    "totalCategories": 3,
-    "activeCategories": 2,
-    "pendingCategories": 1,
-    "eligibleCategories": 2,
-    "totalExamples": 30,
-    "learnedExamples": 26,
-    "pendingExamples": 4,
-    "totalTrainingJobs": 32,
-    "completedJobs": 30,
+    "totalCategories": 4,
+    "activeCategories": 4,
+    "pendingCategories": 0,
+    "eligibleCategories": 4,
+    "totalExamples": 62,
+    "learnedExamples": 62,
+    "pendingExamples": 0,
+    "totalTrainingJobs": 62,
+    "completedJobs": 62,
     "pendingJobs": 0,
-    "failedJobs": 1,
-    "rejectedJobs": 1
+    "failedJobs": 0,
+    "rejectedJobs": 0
+  },
+  "trainingDiagnostics": {
+    "lastAttemptAt": "2026-11-03T11:00:00.000Z",
+    "candidateCategories": [
+      "Factura",
+      "Factura Adiantamento",
+      "Factura Global",
+      "Ficha de Intervenção"
+    ],
+    "candidateExamples": 62,
+    "candidateValidation": {
+      "accuracy": 0.9677,
+      "macroF1": 0.9682,
+      "weightedF1": 0.9685,
+      "manualReviewRate": 0.0323,
+      "perCategory": {
+        "Factura": {
+          "documentType": "Factura",
+          "support": 20,
+          "precision": 0.9524,
+          "recall": 1.0,
+          "f1": 0.9756,
+          "passed": true
+        },
+        "Factura Adiantamento": {
+          "documentType": "Factura Adiantamento",
+          "support": 16,
+          "precision": 1.0,
+          "recall": 0.9375,
+          "f1": 0.9677,
+          "passed": true
+        },
+        "Factura Global": {
+          "documentType": "Factura Global",
+          "support": 12,
+          "precision": 1.0,
+          "recall": 1.0,
+          "f1": 1.0,
+          "passed": true
+        },
+        "Ficha de Intervenção": {
+          "documentType": "Ficha de Intervenção",
+          "support": 14,
+          "precision": 1.0,
+          "recall": 1.0,
+          "f1": 1.0,
+          "passed": true
+        }
+      },
+      "confusionMatrix": {
+        "labels": [
+          "Factura",
+          "Factura Adiantamento",
+          "Factura Global",
+          "Ficha de Intervenção"
+        ],
+        "matrix": [
+          [20, 0, 0, 0],
+          [0, 16, 0, 0],
+          [0, 0, 12, 0],
+          [0, 0, 0, 14]
+        ]
+      }
+    },
+    "activationApproved": true,
+    "rejectionReasons": [],
+    "activeModelVersionBeforeAttempt": "v1.0.5",
+    "activeModelVersionAfterAttempt": "v1.0.6"
   },
   "categories": [
     {
-      "documentType": "Fatura",
+      "documentType": "Factura",
+      "status": "active",
+      "examplesReceived": 20,
+      "minimumExamples": 10,
+      "examplesIncludedInModel": 20,
+      "pendingExamples": 0,
+      "active": true,
+      "validation": {
+        "precision": 0.9524,
+        "recall": 1.0,
+        "f1": 0.9756
+      },
+      "activation": {
+        "eligible": true,
+        "includedInLastCandidate": true,
+        "lastAttemptStatus": "approved",
+        "reasonCode": "VALIDATED_AND_ACTIVE",
+        "reasonMessage": "Categoria validada com sucesso na validação cruzada 5-Fold (F1=0.9756 >= 0.75) e incorporada no modelo ativo v1.0.6.",
+        "candidatePrecision": 0.9524,
+        "candidateRecall": 1.0,
+        "candidateF1": 0.9756,
+        "requiredF1": 0.75
+      },
+      "lastExampleAt": "2026-11-03T10:45:00.000Z"
+    },
+    {
+      "documentType": "Factura Adiantamento",
+      "status": "active",
+      "examplesReceived": 16,
+      "minimumExamples": 10,
+      "examplesIncludedInModel": 16,
+      "pendingExamples": 0,
+      "active": true,
+      "validation": {
+        "precision": 1.0,
+        "recall": 0.9375,
+        "f1": 0.9677
+      },
+      "activation": {
+        "eligible": true,
+        "includedInLastCandidate": true,
+        "lastAttemptStatus": "approved",
+        "reasonCode": "VALIDATED_AND_ACTIVE",
+        "reasonMessage": "Categoria validada com sucesso na validação cruzada 5-Fold (F1=0.9677 >= 0.75) e incorporada no modelo ativo v1.0.6.",
+        "candidatePrecision": 1.0,
+        "candidateRecall": 0.9375,
+        "candidateF1": 0.9677,
+        "requiredF1": 0.75
+      },
+      "lastExampleAt": "2026-11-03T10:50:00.000Z"
+    },
+    {
+      "documentType": "Factura Global",
       "status": "active",
       "examplesReceived": 12,
       "minimumExamples": 10,
@@ -581,11 +721,22 @@ curl -s -X GET "https://wp.processcloud.app/ai-gateway/train/summary" \
       "pendingExamples": 0,
       "active": true,
       "validation": {
-        "precision": 0.92,
-        "recall": 0.91,
-        "f1": 0.91
+        "precision": 1.0,
+        "recall": 1.0,
+        "f1": 1.0
       },
-      "lastExampleAt": "2026-11-03T01:40:00.000Z"
+      "activation": {
+        "eligible": true,
+        "includedInLastCandidate": true,
+        "lastAttemptStatus": "approved",
+        "reasonCode": "VALIDATED_AND_ACTIVE",
+        "reasonMessage": "Categoria validada com sucesso na validação cruzada 5-Fold (F1=1.0000 >= 0.75) e incorporada no modelo ativo v1.0.6.",
+        "candidatePrecision": 1.0,
+        "candidateRecall": 1.0,
+        "candidateF1": 1.0,
+        "requiredF1": 0.75
+      },
+      "lastExampleAt": "2026-11-03T10:52:00.000Z"
     },
     {
       "documentType": "Ficha de Intervenção",
@@ -596,22 +747,22 @@ curl -s -X GET "https://wp.processcloud.app/ai-gateway/train/summary" \
       "pendingExamples": 0,
       "active": true,
       "validation": {
-        "precision": 0.96,
-        "recall": 0.94,
-        "f1": 0.95
+        "precision": 1.0,
+        "recall": 1.0,
+        "f1": 1.0
       },
-      "lastExampleAt": "2026-11-03T01:30:00.000Z"
-    },
-    {
-      "documentType": "Nota de Crédito",
-      "status": "pending_validation",
-      "examplesReceived": 4,
-      "minimumExamples": 10,
-      "examplesIncludedInModel": 0,
-      "pendingExamples": 4,
-      "active": false,
-      "validation": null,
-      "lastExampleAt": "2026-11-03T01:50:00.000Z"
+      "activation": {
+        "eligible": true,
+        "includedInLastCandidate": true,
+        "lastAttemptStatus": "approved",
+        "reasonCode": "VALIDATED_AND_ACTIVE",
+        "reasonMessage": "Categoria validada com sucesso na validação cruzada 5-Fold (F1=1.0000 >= 0.75) e incorporada no modelo ativo v1.0.6.",
+        "candidatePrecision": 1.0,
+        "candidateRecall": 1.0,
+        "candidateF1": 1.0,
+        "requiredF1": 0.75
+      },
+      "lastExampleAt": "2026-11-03T10:40:00.000Z"
     }
   ]
 }
