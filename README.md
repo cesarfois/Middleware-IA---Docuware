@@ -4,7 +4,7 @@ Middleware corporativo containerizado em **Node.js (TypeScript + Fastify)** para
 
 1. **`POST /ai-gateway/extract` (Extração Multimodal Orientada por Contrato JSON):** Envia o PDF ao provedor de IA (`openai`, `gemini` ou `openai_compatible`) seguindo **100% as instruções e o schema dinâmico enviados no JSON `requestData`** pelo DocuWare Workflow Designer, sem prompts de negócio ou schemas fixos no backend.
 2. **`POST /ai-gateway/textshot` (Recuperação de OCR Nativo DocuWare Platform API):** Recupera diretamente o **Textshot (texto OCR já processado pelo DocuWare)** via **DocuWare Platform REST API**, preservando a ordem de múltiplas seções e páginas, sem reprocessar o PDF e sem chamar a OpenAI.
-3. **`POST /ai-gateway/train`, `GET /ai-gateway/train/status` e `POST /ai-gateway/classify` (Classificação Documental com Aprendizagem Automática Local):** Motor local de Machine Learning supervisionado (**TF-IDF de unigramas/bigramas + Regressão Logística Multinomial Balanceada + Validação Cruzada Estratificada 5-Fold + Calibração por Similaridade Cosseno aos Centróides**), executado **100% localmente na VPS**, sem qualquer chamada à OpenAI, Gemini ou serviços pagos.
+3. **`POST /ai-gateway/train`, `GET /ai-gateway/train/status`, `GET /ai-gateway/train/summary`, `GET /ai-gateway/train/history` e `POST /ai-gateway/classify` (Classificação Documental e Monitoramento com Aprendizagem Automática Local):** Motor local de Machine Learning supervisionado (**TF-IDF de unigramas/bigramas + Regressão Logística Multinomial Balanceada + Validação Cruzada Estratificada 5-Fold + Calibração Multiplicativa por Similaridade Cosseno aos Centróides**), executado **100% localmente na VPS**, sem qualquer chamada à OpenAI, Gemini ou serviços pagos.
 
 ---
 
@@ -204,7 +204,7 @@ O adaptador explícito [`adaptLegacyRequestData`](src/schema-builder.ts) preserv
 
 ---
 
-## 4. Classificação Documental com Aprendizagem Automática Local (`/ai-gateway/train`, `/ai-gateway/train/status` e `/ai-gateway/classify`)
+## 4. Classificação Documental e Monitoramento ML Local (`/ai-gateway/train`, `/train/status`, `/train/summary`, `/train/history` e `/classify`)
 
 O middleware inclui um **motor local de Machine Learning supervisionado** ([`src/ml-engine.ts`](src/ml-engine.ts), [`src/classifier-store.ts`](src/classifier-store.ts) e [`src/classifier-service.ts`](src/classifier-service.ts)) que utiliza **TF-IDF de unigramas e bigramas (`1..2`) com sublinear TF**, **Regressão Logística Multinomial Balanceada L2**, **Validação Cruzada Estratificada 5-Fold** e **calibração por similaridade cosseno aos centróides**. Todo o ciclo de aprendizagem e inferência ocorre **100% localmente na VPS**, sem qualquer chamada à OpenAI, Gemini ou serviços pagos.
 
@@ -316,8 +316,10 @@ Permite ao DocuWare Workflow Designer ou à equipa técnica consultar o estado r
     "textshotRetrieved": true,
     "exampleStored": true,
     "includedInModel": false,
+    "isIdempotentDuplicate": false,
     "wasCorrection": false,
     "previousDocumentType": null,
+    "operationType": "new_example",
     "attempts": 1,
     "errorCode": null,
     "errorMessage": null,
@@ -356,8 +358,10 @@ Permite ao DocuWare Workflow Designer ou à equipa técnica consultar o estado r
     "textshotRetrieved": true,
     "exampleStored": true,
     "includedInModel": true,
+    "isIdempotentDuplicate": false,
     "wasCorrection": false,
     "previousDocumentType": null,
+    "operationType": "new_example",
     "attempts": 1,
     "errorCode": null,
     "errorMessage": null,
@@ -376,6 +380,7 @@ Permite ao DocuWare Workflow Designer ou à equipa técnica consultar o estado r
 | `POST /train` | `$.trainingId` | `GV_Training_ID` | ID único do trabalho (`trn-000001`) para consultar em `/train/status`. |
 | `GET /train/status` | `$.jobFinished` | `GV_Job_Concluido` | **Condição de saída do temporizador/loop (`GV_Job_Concluido == true`).** Torna-se `true` assim que o documento termina de ser processado (`stored`, `learned`, `rejected` ou `failed`). |
 | `GET /train/status` | `$.status` | `GV_Status_Treino` | Estado individual do envio (`queued`, `processing`, `stored`, `learned`, `rejected` ou `failed`). |
+| `GET /train/status` | `$.details.operationType` | `GV_Tipo_Operacao` | `"new_example"`, `"idempotent_duplicate"`, `"label_correction"`, `"rejected"`, `"failed"` ou `"pending"`. |
 | `GET /train/status` | `$.category.status` | `GV_Status_Categoria` | `"pending_validation"` ou `"active"`. |
 | `GET /train/status` | `$.category.examplesReceived` | `GV_Exemplos_Categoria` | Total de documentos únicos válidos já armazenados para este tipo documental. |
 | `GET /train/status` | `$.category.eligibleCategoriesCount` | `GV_Categorias_Elegiveis` | Quantidade de categorias que já possuem `>= 10` exemplos válidos (mínimo de `2` para ativar o modelo). |
@@ -476,6 +481,40 @@ Endpoint exclusivamente de leitura para monitorar todas as categorias documentai
 * **Rota:** `/ai-gateway/train/summary` (aliases: `/train/summary`, `/api/train/summary`)
 * **Autenticação:** `X-DocuWare-Token` ou `Authorization: Bearer`
 
+#### Exemplo de Chamada `curl`
+
+```bash
+curl -s -X GET "https://wp.processcloud.app/ai-gateway/train/summary" \
+  -H "X-DocuWare-Token: <SEU_TOKEN_SECRETO_DOCUWARE>"
+```
+
+#### Campos Retornados (`/train/summary`)
+
+| Bloco / Campo | Tipo | Descrição |
+| :--- | :--- | :--- |
+| `model.version` | `string \| null` | Versão do modelo ativo em vigor (ex.: `"v1.0.3"`) ou `null` quando ainda não há modelo ativo. |
+| `model.status` | `string` | `"active"` (modelo validado em produção) ou `"not_ready"` (aguardando mínimo de 2 categorias com `>= 10` exemplos coerentes). |
+| `model.engine` | `string` | Motor ML em uso (`"node_tfidf_logreg"` ou `"python_sklearn"`). |
+| `model.trainedAt` | `string \| null` | Data/hora ISO 8601 da conclusão do treinamento do modelo ativo. |
+| `model.activatedAt` | `string \| null` | Data/hora ISO 8601 da ativação do modelo ativo. |
+| `model.validation` | `object \| null` | Métricas reais da validação cruzada 5-Fold (`accuracy`, `macroF1` e `weightedF1` ponderado pelo suporte de cada classe). |
+| `summary.totalCategories` | `number` | Total de categorias documentais cadastradas. |
+| `summary.activeCategories` | `number` | Quantidade de categorias ativas incorporadas no modelo atual. |
+| `summary.pendingCategories` | `number` | Quantidade de categorias em `"pending_validation"`. |
+| `summary.eligibleCategories` | `number` | Quantidade de categorias que já atingiram `>= 10` exemplos válidos. |
+| `summary.totalExamples` | `number` | Total de documentos únicos válidos armazenados em disco. |
+| `summary.learnedExamples` | `number` | Quantidade de exemplos incorporados na versão ativa do modelo. |
+| `summary.pendingExamples` | `number` | Quantidade de exemplos válidos aguardando incorporação (`totalExamples - learnedExamples`). |
+| `summary.totalTrainingJobs` | `number` | Total histórico de chamadas recebidas em `/train`. |
+| `summary.completedJobs` | `number` | Trabalhos concluídos com sucesso (`stored` + `learned`). |
+| `summary.pendingJobs` | `number` | Trabalhos atualmente na fila (`queued` + `processing`). |
+| `summary.failedJobs` | `number` | Trabalhos com erro técnico (`failed`, ex.: `DOCUMENT_NOT_FOUND`). |
+| `summary.rejectedJobs` | `number` | Trabalhos rejeitados por OCR insuficiente (`rejected`, `INSUFFICIENT_OCR_TEXT`). |
+| `categories[].examplesIncludedInModel` | `number` | Quantidade de exemplos desta categoria incluídos no modelo ativo. |
+| `categories[].pendingExamples` | `number` | Exemplos desta categoria ainda não incorporados no modelo ativo. |
+| `categories[].validation` | `object \| null` | `{ precision, recall, f1 }` reais da categoria no 5-Fold CV (ou `null` se pendente). |
+| `categories[].lastExampleAt` | `string \| null` | Data/hora ISO 8601 do último exemplo válido recebido na categoria. |
+
 #### Exemplo de Resposta (`HTTP 200 OK`)
 
 ```json
@@ -572,6 +611,37 @@ Lista os trabalhos de treinamento ordenados do mais recente para o mais antigo (
 | `to` | `string` | Data/hora final ISO 8601 (ex.: `2026-11-03` ou `2026-11-03T23:59:59Z`). |
 | `limit` | `number` | Quantidade de itens por página (padrão: `50`, máximo: `200`). |
 | `cursor` | `string` | Cursor estável (`trainingId` retornado em `nextCursor` na página anterior). |
+
+#### Tipos de Operação Registados (`operationType`)
+
+| `operationType` | `isIdempotentDuplicate` | `wasCorrection` | Significado |
+| :--- | :---: | :---: | :--- |
+| `"new_example"` | `false` | `false` | Novo documento válido (`fileCabinetId + documentId` inédito) armazenado na categoria. |
+| `"idempotent_duplicate"` | **`true`** | `false` | Reenvio do mesmo documento com a mesma categoria (idempotente; não inflaciona `examplesReceived`). |
+| `"label_correction"` | `false` | **`true`** | Correção supervisionada de rótulo do mesmo documento para uma nova categoria (`previousDocumentType` preenchido). |
+| `"rejected"` | `false` | `false` | Documento rejeitado por texto OCR insuficiente (`errorCode: "INSUFFICIENT_OCR_TEXT"`). |
+| `"failed"` | `false` | `false` | Falha técnica ao recuperar o documento no DocuWare (ex.: `DOCUMENT_NOT_FOUND`). |
+| `"pending"` | `false` | `false` | Trabalho ainda na fila (`queued` ou `processing`). |
+
+#### Exemplos de Chamadas `curl` (`/train/history`)
+
+```bash
+# 1. Consultar os últimos 20 treinamentos
+curl -s -X GET "https://wp.processcloud.app/ai-gateway/train/history?limit=20" \
+  -H "X-DocuWare-Token: <SEU_TOKEN_SECRETO_DOCUWARE>"
+
+# 2. Filtrar por categoria, estado e intervalo de datas
+curl -s -G "https://wp.processcloud.app/ai-gateway/train/history" \
+  -H "X-DocuWare-Token: <SEU_TOKEN_SECRETO_DOCUWARE>" \
+  --data-urlencode "documentType=Ficha de Intervenção" \
+  --data-urlencode "status=learned" \
+  --data-urlencode "from=2026-11-01" \
+  --data-urlencode "to=2026-11-03"
+
+# 3. Avançar para a página seguinte usando o nextCursor
+curl -s -X GET "https://wp.processcloud.app/ai-gateway/train/history?limit=20&cursor=trn-000031" \
+  -H "X-DocuWare-Token: <SEU_TOKEN_SECRETO_DOCUWARE>"
+```
 
 #### Exemplo de Resposta (`HTTP 200 OK`)
 
@@ -714,23 +784,23 @@ MAX_FILE_SIZE=31457280
 ├── src/
 │   ├── server.ts              # Inicialização Fastify e registro das rotas (/health, /extract, /textshot, /train, /classify)
 │   ├── config.ts              # Configurações tipadas lidas de variáveis de ambiente (.env)
-│   ├── types.ts               # Contratos TypeScript para /extract, /textshot, /train e /classify
+│   ├── types.ts               # Contratos TypeScript para /extract, /textshot, /train, /train/status, /train/summary, /train/history e /classify
 │   ├── auth.ts                # Autenticação time-safe (X-DocuWare-Token ou Authorization: Bearer)
 │   ├── docuware-client.ts     # Cliente DocuWare Platform API (cache de sessão, seções, Textshot e truncamento)
 │   ├── ml-engine.ts           # Motor ML determinístico nativo (TF-IDF 1..2 + LogReg Multinomial + 5-Fold CV + Calibração Multiplicativa)
 │   ├── classifier-store.ts    # Persistência transacional em disco (categorias, exemplos, fila, modelos e auditoria)
-│   ├── classifier-service.ts  # Fila assíncrona, deduplicação, correção supervisionada, treino e classificação
+│   ├── classifier-service.ts  # Fila assíncrona, deduplicação, correção supervisionada, monitoramento (/summary, /history), treino e classificação
 │   ├── schema-builder.ts      # Validador de contrato JSON, JSON Schema dinâmico e filtro estrito de saída
 │   ├── openai-service.ts      # Dispatcher multi-provider (OpenAI / Gemini / Compatible) com retry exponencial
 │   ├── routes/
 │   │   ├── extract.ts         # Endpoints POST (/ai-gateway/extract, /extract, /api/extract, /)
 │   │   ├── textshot.ts        # Endpoints POST (/ai-gateway/textshot, /textshot, /api/textshot)
-│   │   ├── classifier.ts      # Endpoints POST /train, GET /train/status e POST /classify
+│   │   ├── classifier.ts      # Endpoints POST /train, GET /train/status, GET /train/summary, GET /train/history e POST /classify
 │   │   └── health.ts          # Endpoints GET (/ai-gateway/health, /health)
 │   └── tests/
 │       ├── gateway.test.ts    # Testes unitários e de aceitação do endpoint /extract (3 execuções no mesmo PDF)
 │       ├── textshot.test.ts   # Testes automatizados dos 6 cenários obrigatórios do endpoint /textshot
-│       └── classifier.test.ts # Testes automatizados dos 16 cenários obrigatórios de aprendizagem e classificação
+│       └── classifier.test.ts # Testes automatizados dos 17 cenários obrigatórios de aprendizagem, monitoramento e classificação
 ├── tests/
 │   └── curl-examples.sh       # Exemplos executáveis de chamadas curl
 ├── Dockerfile                 # Multi-Stage Node 22 Alpine (compila TypeScript, executa testes e gera imagem de produção)
