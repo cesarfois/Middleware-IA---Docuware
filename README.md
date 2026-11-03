@@ -44,8 +44,8 @@ Recupera o texto pesquisável (Textshot) diretamente de documentos já armazenad
 
 ```json
 {
-  "fileCabinetId": "GUID_DO_ARMARIO",
-  "documentId": 12345,
+  "fileCabinetId": "04a67f02-e6a0-4370-aa96-ea2546332cae",
+  "documentId": 1010186,
   "options": {
     "includePages": true,
     "includeCoordinates": false,
@@ -75,8 +75,8 @@ No DocuWare Workflow Designer, mapeie diretamente **`$.text`** para a variável 
 ```json
 {
   "success": true,
-  "documentId": 12345,
-  "fileCabinetId": "GUID_DO_ARMARIO",
+  "documentId": 1010186,
+  "fileCabinetId": "04a67f02-e6a0-4370-aa96-ea2546332cae",
   "source": "docuware_textshot",
   "sectionCount": 1,
   "pageCount": 2,
@@ -94,7 +94,7 @@ No DocuWare Workflow Designer, mapeie diretamente **`$.text`** para a variável 
   },
   "pages": [
     {
-      "sectionId": "12345-sec-01",
+      "sectionId": "1010186-sec-01",
       "sectionIndex": 1,
       "pageNumber": 1,
       "globalPageNumber": 1,
@@ -103,7 +103,7 @@ No DocuWare Workflow Designer, mapeie diretamente **`$.text`** para a variável 
       "coordinatesAvailable": true
     },
     {
-      "sectionId": "12345-sec-01",
+      "sectionId": "1010186-sec-01",
       "sectionIndex": 1,
       "pageNumber": 2,
       "globalPageNumber": 2,
@@ -367,6 +367,17 @@ Permite ao DocuWare Workflow Designer ou à equipa técnica consultar o estado r
 }
 ```
 
+#### Mapeamento JSONPath Recomendado no DocuWare Workflow Designer (`/train` e `/train/status`)
+
+| Endpoint | JSONPath | Variável de Workflow Sugerida | Utilização no Workflow Designer |
+| :--- | :--- | :--- | :--- |
+| `POST /train` | `$.trainingId` | `GV_Training_ID` | ID único do trabalho (`trn-000001`) para consultar em `/train/status`. |
+| `GET /train/status` | `$.jobFinished` | `GV_Job_Concluido` | **Condição de saída do temporizador/loop (`GV_Job_Concluido == true`).** Torna-se `true` assim que o documento termina de ser processado (`stored`, `learned`, `rejected` ou `failed`). |
+| `GET /train/status` | `$.status` | `GV_Status_Treino` | Estado individual do envio (`queued`, `processing`, `stored`, `learned`, `rejected` ou `failed`). |
+| `GET /train/status` | `$.category.status` | `GV_Status_Categoria` | `"pending_validation"` ou `"active"`. |
+| `GET /train/status` | `$.category.examplesReceived` | `GV_Exemplos_Categoria` | Total de documentos únicos válidos já armazenados para este tipo documental. |
+| `GET /train/status` | `$.category.eligibleCategoriesCount` | `GV_Categorias_Elegiveis` | Quantidade de categorias que já possuem `>= 10` exemplos válidos (mínimo de `2` para ativar o modelo). |
+
 ---
 
 ### 4.3. Endpoint de Classificação Automática — `POST /ai-gateway/classify`
@@ -449,7 +460,7 @@ Quando a confiança calibrada é inferior a `0.70` (`CLASSIFIER_MIN_CONFIDENCE`)
 | :--- | :---: | :--- |
 | `INVALID_REQUEST` | `400` | Campos obrigatórios (`fileCabinetId`, `documentId`, `documentType` ou `trainingId`) ausentes ou inválidos. |
 | `TRAINING_JOB_NOT_FOUND` | `404` | `trainingId` informado em `/train/status` não existe. |
-| `MODEL_NOT_READY` | `422` | Chamada a `/classify` antes de existir pelo menos uma categoria ativa (`>= 10` exemplos validados). |
+| `MODEL_NOT_READY` | `422` | Chamada a `/classify` antes de existir um modelo ativo validado (requer no mínimo 2 categorias com `>= 10` exemplos válidos cada e `F1 >= 0.75`). |
 | `DOCUMENT_NOT_FOUND` | `404` / `403` | Documento não encontrado no armário do DocuWare. |
 | `TEXTSHOT_NOT_AVAILABLE` | `422` | Documento ainda sem Textshot OCR disponível no DocuWare. |
 
@@ -461,18 +472,18 @@ Validados automaticamente na suíte [`src/tests/classifier.test.ts`](src/tests/c
 
 | # | Cenário Obrigatório | Resultado Validado |
 | :-: | :--- | :--- |
-| **1** | Enviar um único documento para `/train` e consultar `/train/status` | Retorna `queued` imediato (`trn-000001`) e transita para `stored` após extrair o Textshot. |
+| **1** | Enviar um único documento para `/train` e consultar `/train/status` | Retorna `queued` imediato (`trn-000001`) e transita para `stored` (`jobFinished: true`) após extrair o Textshot. |
 | **2** | Reenviar o mesmo documento (`fileCabinetId + documentId`) com o mesmo tipo | Idempotente: não duplica o exemplo nem inflaciona `examplesReceived`. |
 | **3** | Reenviar o mesmo documento com tipo documental corrigido | `wasCorrection: true`, atualiza `previousDocumentType` e recalcula ambas as categorias. |
-| **4** | Enviar 1 a 9 exemplos de uma nova categoria | Categoria permanece em `pending_validation` (`active: false`) e exemplos em `stored`. |
-| **5** | Enviar o 10.º exemplo de uma categoria coerente | Dispara treino e validação K-Fold automáticos; categoria passa a `active` e exemplos a `learned`. |
+| **4** | Enviar 1 a 9 exemplos de uma nova categoria | Categoria permanece em `pending_validation` (`active: false`) e exemplos em `stored` (`jobFinished: true`). |
+| **5** | Enviar o 10.º exemplo de uma categoria coerente (com `>= 2` categorias elegíveis) | Com 1 categoria elegível, aguarda em `stored`/`pending_validation`; ao atingir a 2.ª categoria com 10 exemplos coerentes, dispara treino e validação 5-Fold automáticos, passando ambas a `active` e os exemplos a `learned`. |
 | **6** | Enviar 10 exemplos incoerentes/contraditórios de uma categoria | Reprova na validação cruzada (`F1 < 0.75`); categoria permanece em `pending_validation`. |
 | **7** | Enviar exemplos provenientes de dois armários diferentes para a mesma categoria | Exemplos de `fc-glpi-001` e `fc-manut-002` consolidam a mesma categoria documental. |
 | **8** | Classificar documento num terceiro armário (`fc-armario-terceiro-999`) | Classifica com sucesso usando o conhecimento adquirido nos outros armários. |
 | **9** | Classificar documento claro de `"Ficha de Intervenção"` | `status: "classified"`, `documentType: "Ficha de Intervenção"`, `requiresManualReview: false`. |
 | **10** | Classificar documento claro de `"Contrato"` | `status: "classified"`, `documentType: "Contrato"`, `requiresManualReview: false`. |
 | **11** | Distinguir entre `"Fatura"`, `"Nota de Crédito"` e `"Fatura de Adiantamento"` | Classifica cada um dos 3 tipos financeiros separadamente com alta confiança. |
-| **12** | Classificar documento ambíguo ou fora de domínio | Retorna `status: "needs_review"`, `documentType: null`, `requiresManualReview: true`. |
+| **12** | Classificar documento ambíguo ou de categoria desconhecida (*Open-Set*) | Testado com texto curto/ambíguo e com documento de categoria desconhecida (`"Guia de Remessa Logística"`): retorna `status: "needs_review"`, `documentType: null`, `requiresManualReview: true`. |
 | **13** | Classificar documento sem Textshot disponível | Retorna `422 TEXTSHOT_NOT_AVAILABLE` estruturado. |
 | **14** | Classificar documento inexistente no DocuWare | Retorna `404 DOCUMENT_NOT_FOUND` estruturado. |
 | **15** | Simular reinício do serviço com trabalhos `processing` na fila | `recoverAndResumeQueue()` recupera os trabalhos do disco (`/app/data`) e conclui a aprendizagem. |
@@ -518,6 +529,11 @@ CLASSIFIER_MAX_FEATURE_PAGES=5
 CLASSIFIER_MIN_CONFIDENCE=0.70
 CLASSIFIER_MIN_MARGIN=0.15
 CLASSIFIER_MIN_VALIDATION_F1=0.75
+CLASSIFIER_MAX_REGRESSION_DROP=0.05
+CLASSIFIER_MAX_JOB_ATTEMPTS=3
+CLASSIFIER_JOB_RETRY_DELAY_MS=500
+CLASSIFIER_WORKER_CONCURRENCY=2
+CLASSIFIER_USE_PYTHON_ENGINE=false
 
 MAX_FILE_SIZE=31457280
 ```
@@ -531,7 +547,7 @@ MAX_FILE_SIZE=31457280
 ├── .github/workflows/
 │   └── deploy.yml             # Pipeline CI/CD GitHub Actions (deploy automático via SSH na Contabo)
 ├── ml/
-│   └── classifier_engine.py   # Motor Python (scikit-learn TF-IDF + LogisticRegression + StratifiedKFold)
+│   └── classifier_engine.py   # Script Python opcional (desativado por padrão; usa motor determinístico nativo)
 ├── scripts/
 │   └── configure-nginx.sh     # Script idempotente que configura /ai-gateway/ no portal_nginx
 ├── src/
@@ -540,7 +556,7 @@ MAX_FILE_SIZE=31457280
 │   ├── types.ts               # Contratos TypeScript para /extract, /textshot, /train e /classify
 │   ├── auth.ts                # Autenticação time-safe (X-DocuWare-Token ou Authorization: Bearer)
 │   ├── docuware-client.ts     # Cliente DocuWare Platform API (cache de sessão, seções, Textshot e truncamento)
-│   ├── ml-engine.ts           # Ponte para o motor ML local (Python scikit-learn + fallback nativo TF-IDF/LogReg)
+│   ├── ml-engine.ts           # Motor ML determinístico nativo (TF-IDF 1..2 + LogReg Multinomial + 5-Fold CV + Calibração Multiplicativa)
 │   ├── classifier-store.ts    # Persistência transacional em disco (categorias, exemplos, fila, modelos e auditoria)
 │   ├── classifier-service.ts  # Fila assíncrona, deduplicação, correção supervisionada, treino e classificação
 │   ├── schema-builder.ts      # Validador de contrato JSON, JSON Schema dinâmico e filtro estrito de saída
@@ -556,8 +572,8 @@ MAX_FILE_SIZE=31457280
 │       └── classifier.test.ts # Testes automatizados dos 16 cenários obrigatórios de aprendizagem e classificação
 ├── tests/
 │   └── curl-examples.sh       # Exemplos executáveis de chamadas curl
-├── Dockerfile                 # Multi-Stage Node 22 Alpine + Python3 scikit-learn (executa build + testes)
-├── docker-compose.yml         # Configuração de produção na VPS Contabo com volume persistente /app/data
+├── Dockerfile                 # Multi-Stage Node 22 Alpine (compila TypeScript, executa testes e gera imagem de produção)
+├── docker-compose.yml         # Configuração de produção na VPS Contabo (127.0.0.1:3014 e volume persistente /app/data)
 ├── .env.example
 ├── package.json
 └── tsconfig.json
