@@ -201,6 +201,7 @@ export class ClassifierService {
   private activeWorkers = 0;
   private trainingInProgress = false;
   private pendingTrainingTrigger = false;
+  private startupEvaluationPromise: Promise<void> | null = null;
   private idleResolvers: Array<() => void> = [];
 
   constructor(
@@ -225,10 +226,8 @@ export class ClassifierService {
     if (pending.length > 0) {
       this.scheduleWorkerPump();
     } else if (this.needsStartupModelEvaluation()) {
-      setImmediate(() => {
-        void this.evaluateAndTrainModelIfNeeded().catch((err) => {
-          console.error('[ClassifierService] Erro na reavaliação de inicialização:', err);
-        });
+      this.startupEvaluationPromise = this.evaluateAndTrainModelIfNeeded().catch((err) => {
+        console.error('[ClassifierService] Erro na reavaliação de inicialização:', err);
       });
     }
     return recoveredCount;
@@ -1066,6 +1065,11 @@ export class ClassifierService {
    * Aguarda até que todos os workers da fila e treinos em curso terminem (útil para testes).
    */
   public async waitForIdle(): Promise<void> {
+    if (this.startupEvaluationPromise) {
+      await this.startupEvaluationPromise;
+      this.startupEvaluationPromise = null;
+    }
+
     const hasPendingJobs = () =>
       this.store
         .getPendingOrInterruptedJobs()
