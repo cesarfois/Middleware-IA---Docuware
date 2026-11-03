@@ -13,7 +13,7 @@ TRAIN_URL="${TRAIN_URL:-https://wp.processcloud.app/ai-gateway/train}"
 TRAIN_STATUS_URL="${TRAIN_STATUS_URL:-https://wp.processcloud.app/ai-gateway/train/status}"
 CLASSIFY_URL="${CLASSIFY_URL:-https://wp.processcloud.app/ai-gateway/classify}"
 HEALTH_URL="${HEALTH_URL:-https://wp.processcloud.app/ai-gateway/health}"
-API_TOKEN="${API_AUTH_TOKEN:-docuware_token_2026}"
+API_TOKEN="${API_AUTH_TOKEN:-<SEU_TOKEN_SECRETO_DOCUWARE>}"
 SAMPLE_PDF="${SAMPLE_PDF:-/tmp/acceptance_sample.pdf}"
 
 if [ ! -f "$SAMPLE_PDF" ]; then

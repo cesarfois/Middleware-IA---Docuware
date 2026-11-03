@@ -239,6 +239,7 @@ export interface TrainStatusResponse {
   success: true;
   trainingId: string;
   status: TrainingJobStatus;
+  jobFinished: boolean;
   documentId: number;
   fileCabinetId: string;
   documentType: string;
@@ -246,6 +247,8 @@ export interface TrainStatusResponse {
     status: CategoryStatus;
     examplesReceived: number;
     minimumExamples: number;
+    eligibleCategoriesCount: number;
+    minimumCategoriesForModel: number;
     active: boolean;
   };
   model: {

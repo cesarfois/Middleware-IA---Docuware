@@ -264,11 +264,22 @@ export class ClassifierService {
 
     const category = this.store.getCategory(job.categoryKey);
     const activeModel = this.store.getActiveModel();
+    const eligibleCategoriesCount = this.store
+      .getAllCategories()
+      .filter(
+        (c) => c.examplesCount >= config.classifierMinExamplesPerCategory
+      ).length;
+    const isTerminalStatus =
+      job.status === 'stored' ||
+      job.status === 'learned' ||
+      job.status === 'rejected' ||
+      job.status === 'failed';
 
     return {
       success: true,
       trainingId: job.trainingId,
       status: job.status,
+      jobFinished: isTerminalStatus,
       documentId: job.documentId,
       fileCabinetId: job.fileCabinetId,
       documentType: job.displayName,
@@ -276,6 +287,8 @@ export class ClassifierService {
         status: category?.status ?? 'pending_validation',
         examplesReceived: category?.examplesCount ?? 0,
         minimumExamples: config.classifierMinExamplesPerCategory,
+        eligibleCategoriesCount,
+        minimumCategoriesForModel: config.classifierMinCategoriesForModel,
         active: category?.status === 'active',
       },
       model: {
@@ -309,10 +322,13 @@ export class ClassifierService {
     const startTime = Date.now();
     const activeModel = this.store.getActiveModel();
 
-    if (!activeModel || activeModel.categories.length === 0) {
+    if (
+      !activeModel ||
+      activeModel.categories.length < config.classifierMinCategoriesForModel
+    ) {
       throw new ClassifierValidationError(
         'MODEL_NOT_READY',
-        `Nenhum modelo de classificação está ativo no momento. É necessário treinar pelo menos uma categoria com o mínimo de ${config.classifierMinExamplesPerCategory} exemplos válidos.`,
+        `Nenhum modelo discriminativo está ativo no momento. É necessário validar pelo menos ${config.classifierMinCategoriesForModel} categorias distintas com o mínimo de ${config.classifierMinExamplesPerCategory} exemplos válidos cada.`,
         422
       );
     }
@@ -582,6 +598,10 @@ export class ClassifierService {
         const cat = this.store.getCategory(job.categoryKey);
         const countNow = cat?.examplesCount ?? 1;
         const minReq = config.classifierMinExamplesPerCategory;
+        const minCats = config.classifierMinCategoriesForModel;
+        const eligibleCatsNow = this.store
+          .getAllCategories()
+          .filter((c) => c.examplesCount >= minReq).length;
 
         // Se for duplicado idempotente e o exemplo já estiver learned no modelo ativo
         if (
@@ -610,8 +630,10 @@ export class ClassifierService {
           : upsertResult.isDuplicateSameCategory
           ? `Documento já registado na categoria "${job.displayName}" (idempotente). Categoria possui ${countNow}/${minReq} exemplos.`
           : countNow < minReq
-          ? `Exemplo válido guardado com sucesso (${countNow}/${minReq} exemplos necessários para ativar a categoria "${job.displayName}").`
-          : `Exemplo válido guardado (${countNow}/${minReq}). A iniciar treino e validação automática do modelo...`;
+          ? `Exemplo válido guardado com sucesso (${countNow}/${minReq} exemplos necessários para a categoria "${job.displayName}").`
+          : eligibleCatsNow < minCats
+          ? `A categoria "${job.displayName}" atingiu ${countNow}/${minReq} exemplos válidos. O treino e validação do modelo serão iniciados automaticamente assim que existir pelo menos ${minCats} categorias com ${minReq} exemplos cada para comparação discriminativa (atualmente: ${eligibleCatsNow}/${minCats} categorias elegíveis).`
+          : `Exemplo válido guardado (${countNow}/${minReq}). A iniciar treino e validação discriminativa automática do modelo...`;
 
         this.store.updateTrainingJob(trainingId, {
           status: 'stored',
@@ -623,7 +645,7 @@ export class ClassifierService {
           errorCode: null,
           errorMessage: null,
           statusMessage: baseStoredMsg,
-          completedAt: countNow < minReq && !upsertResult.wasCorrection ? new Date().toISOString() : null,
+          completedAt: new Date().toISOString(),
         });
 
         // Se não houver outros exemplos aguardando na fila imediata, dispara a avaliação/treino agora;
@@ -705,12 +727,14 @@ export class ClassifierService {
 
   private async runModelTrainingCycle(): Promise<void> {
     const minExamples = config.classifierMinExamplesPerCategory;
+    const minCats = config.classifierMinCategoriesForModel;
     const allCategories = this.store.getAllCategories();
     const eligibleCategories = allCategories.filter(
       (c) => c.examplesCount >= minExamples
     );
 
-    if (eligibleCategories.length === 0) {
+    // Regra de validação discriminativa: exige pelo menos 2 categorias com >= 10 exemplos cada
+    if (eligibleCategories.length < minCats) {
       return;
     }
 
@@ -787,12 +811,12 @@ export class ClassifierService {
         }
       }
 
-      // Se nenhuma categoria passou na validação, não ativamos nenhum modelo novo
-      if (passingKeys.length === 0) {
+      // Se restarem menos de 2 categorias aprovadas, não ativamos um modelo de classe única
+      if (passingKeys.length < minCats) {
         return;
       }
 
-      // Se existem outras categorias válidas que passaram, re-treinamos apenas com as categorias aprovadas
+      // Se existem pelo menos 2 categorias válidas que passaram, re-treinamos apenas com as categorias aprovadas
       const filteredSamples = samples.filter((s) =>
         passingKeys.includes(s.categoryKey)
       );

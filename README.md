@@ -10,17 +10,18 @@ Middleware corporativo containerizado em **Node.js (TypeScript + Fastify)** para
 
 ## 1. Endpoints em Produção (Contabo VPS)
 
-| Operação | Método | Endpoint HTTPS Principal (`portal_nginx`) | Endpoint IP Direto (Porta `3014`) |
+| Operação | Método | Endpoint HTTPS Público (`portal_nginx`) | Endpoint Interno Loopback (VPS `127.0.0.1:3014`) |
 | :--- | :---: | :--- | :--- |
-| **Extração IA (Multipart PDF + JSON)** | `POST` | `https://wp.processcloud.app/ai-gateway/extract` | `http://13.140.173.35:3014/extract` |
-| **Textshot Nativo (DocuWare Platform API)** | `POST` | `https://wp.processcloud.app/ai-gateway/textshot` | `http://13.140.173.35:3014/textshot` |
-| **Aprendizagem Supervisionada Local (1 doc)** | `POST` | `https://wp.processcloud.app/ai-gateway/train` | `http://13.140.173.35:3014/train` |
-| **Consulta de Estado da Aprendizagem** | `GET` | `https://wp.processcloud.app/ai-gateway/train/status` | `http://13.140.173.35:3014/train/status` |
-| **Classificação Automática Local** | `POST` | `https://wp.processcloud.app/ai-gateway/classify` | `http://13.140.173.35:3014/classify` |
-| **Healthcheck de Monitoramento** | `GET` | `https://wp.processcloud.app/ai-gateway/health` | `http://13.140.173.35:3014/health` |
+| **Extração IA (Multipart PDF + JSON)** | `POST` | `https://wp.processcloud.app/ai-gateway/extract` | `http://127.0.0.1:3014/extract` |
+| **Textshot Nativo (DocuWare Platform API)** | `POST` | `https://wp.processcloud.app/ai-gateway/textshot` | `http://127.0.0.1:3014/textshot` |
+| **Aprendizagem Supervisionada Local (1 doc)** | `POST` | `https://wp.processcloud.app/ai-gateway/train` | `http://127.0.0.1:3014/train` |
+| **Consulta de Estado da Aprendizagem** | `GET` | `https://wp.processcloud.app/ai-gateway/train/status` | `http://127.0.0.1:3014/train/status` |
+| **Classificação Automática Local** | `POST` | `https://wp.processcloud.app/ai-gateway/classify` | `http://127.0.0.1:3014/classify` |
+| **Healthcheck de Monitoramento** | `GET` | `https://wp.processcloud.app/ai-gateway/health` | `http://127.0.0.1:3014/health` |
 
 * **Cabeçalho de Autenticação (obrigatório em `/extract`, `/textshot`, `/train`, `/train/status` e `/classify`):**
-  * `X-DocuWare-Token: <API_AUTH_TOKEN>` *(ou `Authorization: Bearer <API_AUTH_TOKEN>`)*
+  * `X-DocuWare-Token: <SEU_TOKEN_SECRETO_DOCUWARE>` *(ou `Authorization: Bearer <SEU_TOKEN_SECRETO_DOCUWARE>`)*
+* **Isolamento de Rede:** A porta `3014` está restrita ao loopback (`127.0.0.1:3014`) e à rede interna Docker `reverse-proxy-network`, garantindo que todo o tráfego externo passe obrigatoriamente pelo proxy HTTPS (`portal_nginx`).
 
 ---
 
@@ -209,10 +210,15 @@ O middleware inclui um **motor local de Machine Learning supervisionado** ([`src
 
 * **Sem tipos documentais fixos no código:** as categorias são criadas exclusivamente pelos exemplos enviados ao endpoint `POST /ai-gateway/train`. O endpoint `POST /ai-gateway/classify` **nunca** cria novos tipos documentais.
 * **Independência face ao excerto de 2.000 caracteres do `/textshot`:** para treino e classificação, o motor recupera até **5 páginas / 15.000 caracteres** (`CLASSIFIER_MAX_FEATURE_PAGES=5`, `CLASSIFIER_MAX_FEATURE_CHARS=15000`), mantendo o endpoint `/textshot` totalmente independente.
-* **Mínimo de 10 exemplos válidos por categoria (`CLASSIFIER_MIN_EXAMPLES_PER_CATEGORY=10`):**
-  * De **1 a 9 exemplos distintos**, a categoria permanece em `status: "pending_validation"` (`active: false`) e os exemplos permanecem em `status: "stored"` (nunca marcados prematuramente como `learned`).
-  * Ao atingir **10 exemplos válidos** (ou ao receber novos exemplos/correções posteriores), o serviço executa automaticamente o treino e a validação cruzada 5-fold em background.
-  * A categoria só passa a `status: "active"` e os exemplos/trabalhos só transitam para `status: "learned"` se o modelo cumprir a métrica mínima de validação (`F1 >= 0.75`, configurável em `CLASSIFIER_MIN_VALIDATION_F1`).
+* **Mínimo de 10 exemplos válidos por categoria (`CLASSIFIER_MIN_EXAMPLES_PER_CATEGORY=10`) e mínimo de 2 categorias para treino discriminativo (`CLASSIFIER_MIN_CATEGORIES_FOR_MODEL=2`):**
+  * De **1 a 9 exemplos distintos**, a categoria permanece em `status: "pending_validation"` (`active: false`) e os exemplos permanecem em `status: "stored"` (`jobFinished: true`).
+  * Como a Regressão Logística Multinomial precisa de pelo menos **2 classes** para aprender fronteiras de decisão reais, o treino e a validação cruzada 5-fold iniciam automaticamente quando existirem **pelo menos 2 categorias com `>= 10` exemplos válidos cada** (`eligibleCategoriesCount >= 2`).
+  * Uma categoria só passa a `status: "active"` e os seus exemplos/trabalhos só transitam para `status: "learned"` se o modelo cumprir a métrica mínima de validação (`F1 >= 0.75`, configurável em `CLASSIFIER_MIN_VALIDATION_F1`).
+* **Calibração multiplicativa contra documentos desconhecidos (*Open-Set Protection*):**
+  * A pontuação final combina a probabilidade `softmax` ($p$) com a razão de coesão ao centróide da classe ($\text{cohesionRatio} = \min(1, \text{sim} / \max(0.25, \text{intraSim} \times 0.85))$) de forma multiplicativa:
+    $$\text{calibrated} = p \times (0.35 + 0.65 \times \text{cohesionRatio})$$
+  * Além disso, exige-se uma similaridade mínima adaptativa $\text{sim} \ge \max(0.18, \text{intraSim} \times 0.45)$. Assim, um documento pertencente a uma categoria ainda desconhecida pelo modelo nunca recebe aprovação mesmo que o `softmax` seja alto, sendo encaminhado com segurança para `needs_review`.
+* **Motor único determinístico sem fallback silencioso:** utiliza por padrão o motor nativo determinístico (`node_tfidf_logreg`). Se `CLASSIFIER_USE_PYTHON_ENGINE=true` for exigido explicitamente e falhar, o erro é propagado sem fallback silencioso.
 * **Partilha de conhecimento entre armários:** exemplos aprendidos nos armários A e B permitem classificar documentos no armário C. O `fileCabinetId` é guardado apenas como metadado operacional para consulta do Textshot e **nunca** é usado como feature de previsão.
 * **Deduplicação e correção supervisionada (`fileCabinetId + documentId`):**
   * Reenviar o mesmo documento com o **mesmo `documentType`** é **idempotente** e não inflaciona `examplesReceived`.
@@ -232,7 +238,7 @@ Submete **um único documento** já armazenado no DocuWare para aprendizagem sup
 
 ```json
 {
-  "fileCabinetId": "44324259-b89d-4d00-9304-21772729a54a",
+  "fileCabinetId": "04a67f02-e6a0-4370-aa96-ea2546332cae",
   "documentId": 1010186,
   "documentType": "Ficha de Intervenção"
 }
@@ -251,7 +257,7 @@ Submete **um único documento** já armazenado no DocuWare para aprendizagem sup
   "success": true,
   "trainingId": "trn-000001",
   "documentId": 1010186,
-  "fileCabinetId": "44324259-b89d-4d00-9304-21772729a54a",
+  "fileCabinetId": "04a67f02-e6a0-4370-aa96-ea2546332cae",
   "documentType": "Ficha de Intervenção",
   "status": "queued",
   "message": "Exemplo recebido e colocado em fila para aprendizagem."
@@ -267,31 +273,37 @@ Permite ao DocuWare Workflow Designer ou à equipa técnica consultar o estado r
 * **Método:** `GET`
 * **Rota:** `/ai-gateway/train/status?trainingId=trn-000001` (aliases: `/train/status`, `/api/train/status`)
 
+> **Regra importante para o Temporizador/Loop no Workflow Designer:**
+> Caso o workflow consulte `/train/status`, a condição de saída do loop deve ser **`$.jobFinished == true`** (e **nunca** `$.status == "learned"`). Quando uma categoria ainda tem menos de 10 exemplos (ou quando ainda não existem 2 categorias elegíveis), **`stored` é o estado final normal daquele envio** (`jobFinished: true`). A transição para `learned` ocorrerá posteriormente em background quando o lote atingir o limiar de treino.
+
 #### Estados Possíveis do Trabalho (`status`)
 
-| Estado | Significado |
-| :--- | :--- |
-| `queued` | Recebido e guardado na fila persistente para processamento assíncrono. |
-| `processing` | Worker em execução a recuperar o Textshot no DocuWare ou a treinar o modelo. |
-| `stored` | Textshot validado e exemplo guardado, aguardando que a categoria atinja o mínimo de 10 exemplos coerentes (`pending_validation`). |
-| `learned` | Exemplo incorporado numa versão treinada, validada e ativada do modelo (`category.status = "active"`). |
-| `rejected` | Documento rejeitado para treino por não possuir texto OCR suficiente (`INSUFFICIENT_OCR_TEXT`). Não incrementa a contagem da categoria. |
-| `failed` | Erro técnico ao consultar o DocuWare após todas as retentativas automáticas (ex.: `DOCUMENT_NOT_FOUND`, `TEXTSHOT_NOT_AVAILABLE`). |
+| Estado | `jobFinished` | Significado |
+| :--- | :---: | :--- |
+| `queued` | `false` | Recebido e guardado na fila persistente para processamento assíncrono. |
+| `processing` | `false` | Worker em execução a recuperar o Textshot no DocuWare ou a validar o conteúdo OCR. |
+| `stored` | **`true`** | Textshot validado e exemplo guardado. Processamento individual do documento concluído; aguarda que existam pelo menos 2 categorias com 10 exemplos coerentes (`pending_validation`). |
+| `learned` | **`true`** | Exemplo incorporado numa versão treinada, validada e ativada do modelo (`category.status = "active"`). |
+| `rejected` | **`true`** | Documento rejeitado para treino por não possuir texto OCR suficiente (`INSUFFICIENT_OCR_TEXT`). Não incrementa a contagem da categoria. |
+| `failed` | **`true`** | Erro técnico ao consultar o DocuWare após todas as retentativas automáticas (ex.: `DOCUMENT_NOT_FOUND`, `TEXTSHOT_NOT_AVAILABLE`). |
 
-#### Exemplo de Resposta quando `stored` (1 a 9 exemplos — categoria em `pending_validation`)
+#### Exemplo de Resposta quando `stored` (`jobFinished: true` — categoria em `pending_validation`)
 
 ```json
 {
   "success": true,
   "trainingId": "trn-000001",
   "status": "stored",
+  "jobFinished": true,
   "documentId": 1010186,
-  "fileCabinetId": "44324259-b89d-4d00-9304-21772729a54a",
+  "fileCabinetId": "04a67f02-e6a0-4370-aa96-ea2546332cae",
   "documentType": "Ficha de Intervenção",
   "category": {
     "status": "pending_validation",
     "examplesReceived": 4,
     "minimumExamples": 10,
+    "eligibleCategoriesCount": 0,
+    "minimumCategoriesForModel": 2,
     "active": false
   },
   "model": {
@@ -311,29 +323,32 @@ Permite ao DocuWare Workflow Designer ou à equipa técnica consultar o estado r
     "updatedAt": "2026-11-02T23:00:01.000Z",
     "completedAt": "2026-11-02T23:00:01.000Z"
   },
-  "message": "Exemplo válido guardado com sucesso (4/10 exemplos necessários para ativar a categoria \"Ficha de Intervenção\")."
+  "message": "Exemplo válido guardado com sucesso (4/10 exemplos necessários para a categoria \"Ficha de Intervenção\")."
 }
 ```
 
-#### Exemplo de Resposta quando `learned` (>= 10 exemplos — categoria validada e `active`)
+#### Exemplo de Resposta quando `learned` (`jobFinished: true` — `>= 2` categorias com `>= 10` exemplos validadas e `active`)
 
 ```json
 {
   "success": true,
-  "trainingId": "trn-000010",
+  "trainingId": "trn-000020",
   "status": "learned",
+  "jobFinished": true,
   "documentId": 1010195,
-  "fileCabinetId": "44324259-b89d-4d00-9304-21772729a54a",
+  "fileCabinetId": "04a67f02-e6a0-4370-aa96-ea2546332cae",
   "documentType": "Ficha de Intervenção",
   "category": {
     "status": "active",
     "examplesReceived": 10,
     "minimumExamples": 10,
+    "eligibleCategoriesCount": 2,
+    "minimumCategoriesForModel": 2,
     "active": true
   },
   "model": {
     "version": "v1.0.1",
-    "validationAccuracy": 0.94
+    "validationAccuracy": 0.95
   },
   "details": {
     "textshotRetrieved": true,
@@ -348,7 +363,7 @@ Permite ao DocuWare Workflow Designer ou à equipa técnica consultar o estado r
     "updatedAt": "2026-11-02T23:05:02.000Z",
     "completedAt": "2026-11-02T23:05:02.000Z"
   },
-  "message": "Exemplo aprendido com sucesso e incorporado na versão v1.0.1 do modelo (precisão de validação: 94.0%)."
+  "message": "Exemplo aprendido com sucesso e incorporado na versão v1.0.1 do modelo (precisão de validação: 95.0%)."
 }
 ```
 
@@ -366,7 +381,7 @@ Recupera o Textshot do documento no DocuWare e classifica-o localmente utilizand
 
 ```json
 {
-  "fileCabinetId": "44324259-b89d-4d00-9304-21772729a54a",
+  "fileCabinetId": "04a67f02-e6a0-4370-aa96-ea2546332cae",
   "documentId": 1010186
 }
 ```
@@ -378,7 +393,7 @@ Recupera o Textshot do documento no DocuWare e classifica-o localmente utilizand
   "success": true,
   "status": "classified",
   "documentId": 1010186,
-  "fileCabinetId": "44324259-b89d-4d00-9304-21772729a54a",
+  "fileCabinetId": "04a67f02-e6a0-4370-aa96-ea2546332cae",
   "classification": {
     "documentType": "Ficha de Intervenção",
     "confidence": 0.93,
@@ -393,22 +408,22 @@ Recupera o Textshot do documento no DocuWare e classifica-o localmente utilizand
 }
 ```
 
-#### Resposta quando Ambíguo ou com Confiança Insuficiente (`status: "needs_review"`)
+#### Resposta quando Ambíguo, de Categoria Desconhecida ou com Confiança Insuficiente (`status: "needs_review"`)
 
-Quando a confiança é inferior a `0.70` (`CLASSIFIER_MIN_CONFIDENCE`), a margem entre a 1.ª e a 2.ª categoria é inferior a `0.15` (`CLASSIFIER_MIN_MARGIN`), a similaridade ao centróide é baixa ou o texto OCR é insuficiente, o endpoint **não força uma classificação arriscada** e devolve `documentType: null` e `requiresManualReview: true`:
+Quando a confiança calibrada é inferior a `0.70` (`CLASSIFIER_MIN_CONFIDENCE`), a margem entre a 1.ª e a 2.ª categoria é inferior a `0.15` (`CLASSIFIER_MIN_MARGIN`), a similaridade cosseno ao centróide é inferior ao limiar adaptativo da classe (`max(0.18, intraSim * 0.45)`) ou o texto OCR é insuficiente, o endpoint **não força uma classificação arriscada** e devolve `documentType: null` e `requiresManualReview: true`:
 
 ```json
 {
   "success": true,
   "status": "needs_review",
   "documentId": 1010186,
-  "fileCabinetId": "44324259-b89d-4d00-9304-21772729a54a",
+  "fileCabinetId": "04a67f02-e6a0-4370-aa96-ea2546332cae",
   "classification": {
     "documentType": null,
-    "confidence": 0.48,
+    "confidence": 0.42,
     "requiresManualReview": true,
     "secondBestDocumentType": "Nota de Crédito",
-    "secondBestConfidence": 0.41
+    "secondBestConfidence": 0.35
   },
   "model": {
     "version": "v1.0.1"
@@ -475,7 +490,7 @@ HOST=0.0.0.0
 NODE_ENV=production
 
 # Token de proteção do Gateway (enviado pelo DocuWare no header X-DocuWare-Token)
-API_AUTH_TOKEN=docuware_token_2026
+API_AUTH_TOKEN=<SEU_TOKEN_SECRETO_DOCUWARE>
 
 # Provedor OpenAI (/ai-gateway/extract)
 OPENAI_API_KEY=sk-proj-...
@@ -496,6 +511,7 @@ DOCUWARE_MAX_TEXTSHOT_CHARS=2000000
 # Classificador Local Supervisionado (/ai-gateway/train e /ai-gateway/classify)
 CLASSIFIER_DATA_DIR=/app/data
 CLASSIFIER_MIN_EXAMPLES_PER_CATEGORY=10
+CLASSIFIER_MIN_CATEGORIES_FOR_MODEL=2
 CLASSIFIER_MIN_TEXT_CHARS=30
 CLASSIFIER_MAX_FEATURE_CHARS=15000
 CLASSIFIER_MAX_FEATURE_PAGES=5

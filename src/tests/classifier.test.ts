@@ -212,13 +212,16 @@ describe('Sistema de Aprendizagem Supervisionada e Classificação Automática L
     // Consulta estado via getTrainingStatus
     const statusBody1 = service.getTrainingStatus(body1.trainingId);
     assert.equal(statusBody1.status, 'stored');
+    assert.equal(statusBody1.jobFinished, true);
     assert.equal(statusBody1.category.status, 'pending_validation');
     assert.equal(statusBody1.category.examplesReceived, 1);
     assert.equal(statusBody1.category.minimumExamples, 10);
+    assert.equal(statusBody1.category.minimumCategoriesForModel, 2);
     assert.equal(statusBody1.category.active, false);
     assert.equal(statusBody1.details.textshotRetrieved, true);
     assert.equal(statusBody1.details.exampleStored, true);
     assert.equal(statusBody1.details.includedInModel, false);
+    assert.ok(statusBody1.details.completedAt !== null);
 
     // 2. Reenvia o MESMO documento (mesmo fileCabinetId + documentId) com o MESMO documentType (variação de maiúsculas)
     const req2 = validateAndNormalizeTrainRequest({
@@ -288,7 +291,7 @@ describe('Sistema de Aprendizagem Supervisionada e Classificação Automática L
     assert.equal(status9.category.examplesReceived, 9);
     assert.equal(status9.category.active, false);
 
-    // Envia agora o 10.º exemplo da categoria "Ficha de Intervenção"
+    // Envia agora o 10.º exemplo da 1.ª categoria ("Ficha de Intervenção")
     const cab10 = 'fc-manut-002';
     mockDocuments.set(`${cab10}:1010`, buildRealisticOcrText('ficha_intervencao', 1010));
     const req10 = validateAndNormalizeTrainRequest({
@@ -300,15 +303,48 @@ describe('Sistema de Aprendizagem Supervisionada e Classificação Automática L
 
     await service.waitForIdle();
 
-    // Confirma que o 10.º exemplo disparou o treino automático, validou o modelo e passou a 'learned' e 'active'
+    // Com apenas 1 categoria elegível (1/2), o trabalho individual termina (jobFinished: true, status: 'stored')
+    // sem ativar um modelo de classe única sem comparação real entre categorias!
+    const status10SingleCat = service.getTrainingStatus(job10Id);
+    assert.equal(status10SingleCat.status, 'stored');
+    assert.equal(status10SingleCat.jobFinished, true);
+    assert.equal(status10SingleCat.category.examplesReceived, 10);
+    assert.equal(status10SingleCat.category.eligibleCategoriesCount, 1);
+    assert.equal(status10SingleCat.category.minimumCategoriesForModel, 2);
+    assert.equal(status10SingleCat.category.active, false);
+
+    // Envia agora 10 exemplos da 2.ª categoria ("Contrato") para habilitar a comparação discriminativa real (>= 2 categorias)
+    let jobContrato10Id = '';
+    for (let i = 1; i <= 10; i++) {
+      const docId = 2000 + i;
+      const cab = 'fc-juridico';
+      mockDocuments.set(`${cab}:${docId}`, buildRealisticOcrText('contrato', docId));
+      const req = validateAndNormalizeTrainRequest({
+        fileCabinetId: cab,
+        documentId: docId,
+        documentType: 'Contrato',
+      });
+      jobContrato10Id = service.enqueueTrainingDocument(req).trainingId;
+    }
+
+    await service.waitForIdle();
+
+    // Confirma que ao atingir 2 categorias elegíveis (>= 10 exemplos cada), o treino e validação 5-fold
+    // ativaram AMBAS as categorias ('Ficha de Intervenção' e 'Contrato') e transitaram os exemplos para 'learned'!
     const status10 = service.getTrainingStatus(job10Id);
     assert.equal(status10.status, 'learned');
+    assert.equal(status10.jobFinished, true);
     assert.equal(status10.category.status, 'active');
     assert.equal(status10.category.examplesReceived, 10);
+    assert.equal(status10.category.eligibleCategoriesCount, 2);
     assert.equal(status10.category.active, true);
     assert.equal(status10.details.includedInModel, true);
     assert.ok(status10.model.version?.startsWith('v1.0.'));
     assert.ok((status10.model.validationAccuracy ?? 0) >= 0.75);
+
+    const statusContrato10 = service.getTrainingStatus(jobContrato10Id);
+    assert.equal(statusContrato10.status, 'learned');
+    assert.equal(statusContrato10.category.status, 'active');
   });
 
   it('Cenário 6: Deve manter uma categoria com 10 exemplos incoerentes em pending_validation sem ativá-la no modelo', async () => {
@@ -350,9 +386,8 @@ describe('Sistema de Aprendizagem Supervisionada e Classificação Automática L
     store.flush();
   });
 
-  it('Cenário 8, 9, 10 e 11: Deve treinar Contrato, Fatura, Nota de Crédito e Fatura de Adiantamento e classificar corretamente num terceiro armário', async () => {
+  it('Cenário 8, 9, 10 e 11: Deve treinar Fatura, Nota de Crédito e Fatura de Adiantamento e classificar corretamente num terceiro armário', async () => {
     const categoriesToTrain = [
-      { type: 'Contrato', kind: 'contrato', baseId: 2000, cab: 'fc-juridico' },
       { type: 'Fatura', kind: 'fatura', baseId: 3000, cab: 'fc-financeiro-a' },
       {
         type: 'Nota de Crédito',
@@ -466,7 +501,7 @@ describe('Sistema de Aprendizagem Supervisionada e Classificação Automática L
     );
   });
 
-  it('Cenário 12: Deve devolver status "needs_review" (documentType: null, requiresManualReview: true) para documento ambíguo ou fora de domínio', async () => {
+  it('Cenário 12: Deve devolver status "needs_review" (documentType: null, requiresManualReview: true) para documento ambíguo ou de categoria desconhecida', async () => {
     const cab = 'fc-armario-terceiro-999';
     mockDocuments.set(`${cab}:8099`, buildRealisticOcrText('ambiguo', 8099));
 
@@ -480,6 +515,22 @@ describe('Sistema de Aprendizagem Supervisionada e Classificação Automática L
     assert.equal(body.status, 'needs_review');
     assert.equal(body.classification.documentType, null);
     assert.equal(body.classification.requiresManualReview, true);
+
+    // Testa também um documento de uma categoria ainda desconhecida pelo modelo (ex: Guia de Remessa Logística)
+    // que compartilha algumas palavras isoladas ("Cliente", "Luanda", "Equipamento") com categorias conhecidas
+    mockDocuments.set(
+      `${cab}:8100`,
+      'GUIA DE REMESSA E TRANSPORTE RODOVIÁRIO Nº GR-8100. Motorista: Carlos Mendes. Viatura Matrícula LD-44-22. Peso Bruto: 450kg. Local de Descarga: Armazém Central de Luanda. Mercadoria entregue ao Cliente em paletes seladas.'
+    );
+    const unknownCatBody = await service.classifyDocument(
+      validateAndNormalizeClassifyRequest({
+        fileCabinetId: cab,
+        documentId: 8100,
+      })
+    );
+    assert.equal(unknownCatBody.status, 'needs_review');
+    assert.equal(unknownCatBody.classification.documentType, null);
+    assert.equal(unknownCatBody.classification.requiresManualReview, true);
   });
 
   it('Cenário 13 e 14: Deve tratar documento sem Textshot disponível e documento inexistente no DocuWare', async () => {

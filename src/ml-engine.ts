@@ -296,83 +296,12 @@ function trainAndValidateInNode(
         : 0;
   }
 
-  // Caso 1: Apenas 1 categoria elegível (>= 10 exemplos) -> Validação 5-Fold de Coesão
-  if (uniqueLabels.length === 1) {
-    const lbl = uniqueLabels[0];
-    const kFolds = Math.min(5, nDocs);
-    const foldSize = Math.max(1, Math.floor(nDocs / kFolds));
-    let heldOutRight = 0;
-    let reviewCount = 0;
-
-    for (let f = 0; f < kFolds; f++) {
-      const start = f * foldSize;
-      const end = f === kFolds - 1 ? nDocs : (f + 1) * foldSize;
-      const trainVecs: number[][] = [];
-      const valVecs: number[][] = [];
-
-      for (let i = 0; i < nDocs; i++) {
-        if (i >= start && i < end) {
-          valVecs.push(X[i]);
-        } else {
-          trainVecs.push(X[i]);
-        }
-      }
-
-      const dim = sortedTerms.length;
-      const trMean = new Array<number>(dim).fill(0);
-      for (const v of trainVecs) {
-        for (let j = 0; j < dim; j++) trMean[j] += v[j];
-      }
-      const trCentroid = l2Normalize(trMean);
-
-      for (const v of valVecs) {
-        const sim = cosineSimilarity(v, trCentroid);
-        const conf = Math.min(0.99, Math.max(0, (sim - 0.05) / 0.45));
-        if (conf >= minConfidence) {
-          heldOutRight++;
-        } else {
-          reviewCount++;
-        }
-      }
-    }
-
-    const acc = nDocs > 0 ? heldOutRight / nDocs : 0;
-    const f1Val = acc > 0 ? (2 * acc) / (1 + acc) : 0;
-    const reviewRate = nDocs > 0 ? reviewCount / nDocs : 1;
-
-    return {
-      report: {
-        accuracy: Number(acc.toFixed(4)),
-        macroF1: Number(f1Val.toFixed(4)),
-        manualReviewRate: Number(reviewRate.toFixed(4)),
-        perCategory: {
-          [lbl]: {
-            categoryKey: lbl,
-            displayName: displayMap[lbl],
-            support: samples.length,
-            precision: heldOutRight > 0 ? 1 : 0,
-            recall: Number(acc.toFixed(4)),
-            f1Score: Number(f1Val.toFixed(4)),
-          },
-        },
-        confusionMatrix: {
-          labels: uniqueLabels,
-          matrix: [[heldOutRight]],
-        },
-        engine: 'node_tfidf_logreg',
-      },
-      artifact: {
-        engine: 'node_tfidf_logreg',
-        labels: uniqueLabels,
-        displayMap,
-        terms: sortedTerms,
-        idf,
-        centroids,
-        intraSims,
-        weights: null,
-        intercepts: null,
-      },
-    };
+  // Regra arquitetural: A Regressão Logística Multinomial exige no mínimo 2 categorias distintas
+  // para aprender fronteiras de decisão reais e validar capacidade discriminativa entre classes.
+  if (uniqueLabels.length < 2) {
+    throw new Error(
+      'O treino discriminativo exige pelo menos 2 categorias elegíveis para comparação real entre tipos documentais.'
+    );
   }
 
   // Função interna para treinar Regressão Logística Multinomial Balanceada via Gradiente Descendente L2
@@ -380,7 +309,12 @@ function trainAndValidateInNode(
     trainX: number[][],
     trainY: string[],
     classes: string[]
-  ): { weights: number[][]; intercepts: number[]; classCentroids: Record<string, number[]> } {
+  ): {
+    weights: number[][];
+    intercepts: number[];
+    classCentroids: Record<string, number[]>;
+    classIntraSims: Record<string, number>;
+  } {
     const nClasses = classes.length;
     const nFeatures = sortedTerms.length;
     const nSamples = trainX.length;
@@ -400,6 +334,7 @@ function trainAndValidateInNode(
 
     // Inicializa pesos com os centróides escalados para convergência rápida e determinística
     const classCentroids: Record<string, number[]> = {};
+    const classIntraSims: Record<string, number> = {};
     const W: number[][] = Array.from({ length: nClasses }, () =>
       new Array<number>(nFeatures).fill(0)
     );
@@ -414,6 +349,11 @@ function trainAndValidateInNode(
       }
       const normC = l2Normalize(mean);
       classCentroids[cLbl] = normC;
+      const sims = vecs.map((v) => cosineSimilarity(v, normC));
+      classIntraSims[cLbl] =
+        sims.length > 0
+          ? sims.reduce((acc, val) => acc + val, 0) / sims.length
+          : 0.35;
       for (let j = 0; j < nFeatures; j++) {
         W[c][j] = normC[j] * 4.0;
       }
@@ -457,7 +397,7 @@ function trainAndValidateInNode(
       }
     }
 
-    return { weights: W, intercepts: b, classCentroids };
+    return { weights: W, intercepts: b, classCentroids, classIntraSims };
   }
 
   // Stratified K-Fold (até 5 folds)
@@ -510,11 +450,18 @@ function trainAndValidateInNode(
         .map((lbl, idx) => {
           const p = probs[idx];
           const sim = cosineSimilarity(x, foldModel.classCentroids[lbl] || []);
-          const calibrated = 0.65 * p + 0.35 * Math.min(1.0, sim / 0.35);
+          const intraSim = foldModel.classIntraSims[lbl] || 0.35;
+          const cohesionRatio = Math.min(
+            1.0,
+            sim / Math.max(0.25, intraSim * 0.85)
+          );
+          const calibrated = p * (0.35 + 0.65 * cohesionRatio);
+          const minSimRequired = Math.max(0.18, intraSim * 0.45);
           return {
             lbl,
             p,
             sim,
+            minSimRequired,
             calibrated: Math.min(0.99, Math.max(0, calibrated)),
           };
         })
@@ -525,6 +472,7 @@ function trainAndValidateInNode(
         lbl: best.lbl,
         p: 0,
         sim: 0,
+        minSimRequired: 0.18,
         calibrated: 0,
       };
       const margin = best.calibrated - second.calibrated;
@@ -533,7 +481,7 @@ function trainAndValidateInNode(
       if (
         best.calibrated < minConfidence ||
         margin < minMargin ||
-        best.sim < 0.15
+        best.sim < best.minSimRequired
       ) {
         reviewCount++;
         yPredAll.push('__needs_review__');
@@ -632,8 +580,9 @@ function trainAndValidateInNode(
 }
 
 /**
- * Executa o treino e validação tentando primeiramente o motor Python (scikit-learn)
- * e utilizando o motor TF-IDF + Regressão Logística em Node caso Python não esteja instalado no host.
+ * Executa o treino e validação utilizando o motor TF-IDF + Regressão Logística Multinomial Balanceada.
+ * Não utiliza fallback silencioso: se CLASSIFIER_USE_PYTHON_ENGINE=true for configurado explicitamente
+ * e o processo Python falhar, o erro é propagado explicitamente.
  */
 export async function executeModelTraining(
   samples: TrainingSampleInput[],
@@ -646,7 +595,7 @@ export async function executeModelTraining(
 
   const scriptPath = path.resolve(process.cwd(), 'ml', 'classifier_engine.py');
 
-  return new Promise((resolve) => {
+  return new Promise((resolve, reject) => {
     let stdoutData = '';
     let stderrData = '';
     let settled = false;
@@ -655,14 +604,14 @@ export async function executeModelTraining(
       stdio: ['pipe', 'pipe', 'pipe'],
     });
 
-    const fallbackToNode = () => {
+    const failWithReason = (reason: string) => {
       if (settled) return;
       settled = true;
-      resolve(trainAndValidateInNode(samples, minConfidence, minMargin));
+      reject(new Error(`Falha no motor Python de classificação: ${reason}`));
     };
 
-    child.on('error', () => {
-      fallbackToNode();
+    child.on('error', (err) => {
+      failWithReason(err.message);
     });
 
     child.stdout.on('data', (chunk: Buffer) => {
@@ -676,16 +625,19 @@ export async function executeModelTraining(
     child.on('close', (code) => {
       if (settled) return;
       if (code !== 0 || !stdoutData.trim()) {
-        void stderrData;
-        fallbackToNode();
+        failWithReason(
+          stderrData.trim() || `Processo terminou com código ${code}`
+        );
         return;
       }
       try {
         const parsed = JSON.parse(stdoutData) as TrainingExecutionOutput;
         settled = true;
         resolve(parsed);
-      } catch {
-        fallbackToNode();
+      } catch (err) {
+        failWithReason(
+          err instanceof Error ? err.message : 'JSON de saída inválido'
+        );
       }
     });
 
@@ -696,8 +648,8 @@ export async function executeModelTraining(
       minMargin,
     });
 
-    child.stdin.on('error', () => {
-      fallbackToNode();
+    child.stdin.on('error', (err) => {
+      failWithReason(err.message);
     });
     child.stdin.write(payload);
     child.stdin.end();
@@ -706,7 +658,8 @@ export async function executeModelTraining(
 
 /**
  * Executa a inferência local sobre um texto OCR normalizado utilizando o modelo ativo,
- * calibrando a confiança e avaliando ambiguidade/revisão manual.
+ * calibrando a confiança de forma multiplicativa pela coesão da classe (intraSim)
+ * para rejeitar documentos fora da distribuição (categorias desconhecidas) ou ambíguos.
  */
 export function predictWithModelArtifact(
   normalizedText: string,
@@ -724,7 +677,13 @@ export function predictWithModelArtifact(
   );
 
   // Se o documento praticamente não compartilha vocabulário com nenhuma categoria conhecida
-  if (matchedTermsCount < 2) {
+  // ou se o modelo não possui pelo menos 2 categorias discriminativas com pesos aprendidos
+  if (
+    matchedTermsCount < 2 ||
+    artifact.labels.length < 2 ||
+    !artifact.weights ||
+    !artifact.intercepts
+  ) {
     return {
       status: 'needs_review',
       documentType: null,
@@ -738,63 +697,30 @@ export function predictWithModelArtifact(
     };
   }
 
-  // Caso 1: Modelo de classe única (1 categoria ativa) -> avaliação via similaridade cosseno com centróide
-  if (
-    artifact.labels.length === 1 ||
-    !artifact.weights ||
-    !artifact.intercepts
-  ) {
-    const lbl = artifact.labels[0];
-    const centroid = artifact.centroids[lbl] || [];
-    const sim = cosineSimilarity(vector, centroid);
-    const calibratedConf = Number(
-      Math.min(0.99, Math.max(0, (sim - 0.05) / 0.45)).toFixed(4)
-    );
-
-    if (calibratedConf < minConfidence || sim < 0.18) {
-      return {
-        status: 'needs_review',
-        documentType: null,
-        categoryKey: null,
-        confidence: calibratedConf,
-        requiresManualReview: true,
-        secondBestDocumentType: null,
-        secondBestConfidence: null,
-        margin: calibratedConf,
-        centroidSimilarity: Number(sim.toFixed(4)),
-      };
-    }
-
-    return {
-      status: 'classified',
-      documentType: artifact.displayMap[lbl] || lbl,
-      categoryKey: lbl,
-      confidence: calibratedConf,
-      requiresManualReview: false,
-      secondBestDocumentType: null,
-      secondBestConfidence: null,
-      margin: calibratedConf,
-      centroidSimilarity: Number(sim.toFixed(4)),
-    };
-  }
-
-  // Caso 2: Modelo multi-classe (>= 2 categorias ativas)
   const logits = artifact.weights.map(
     (wRow, idx) => dotProduct(wRow, vector) + (artifact.intercepts?.[idx] ?? 0)
   );
   const probs = softmax(logits);
 
-  // Combina probabilidade discriminativa (Regressão Logística) com similaridade cosseno ao centróide da classe
+  // Calibração multiplicativa: um softmax alto NUNCA aprova um documento desconhecido
+  // se a similaridade cosseno ao centróide da classe for baixa relativamente à coesão aprendida (intraSims)
   const scored = artifact.labels
     .map((lbl, idx) => {
       const p = probs[idx];
       const sim = cosineSimilarity(vector, artifact.centroids[lbl] || []);
-      const calibrated = 0.65 * p + 0.35 * Math.min(1.0, sim / 0.35);
+      const intraSim = artifact.intraSims[lbl] || 0.35;
+      const cohesionRatio = Math.min(
+        1.0,
+        sim / Math.max(0.25, intraSim * 0.85)
+      );
+      const calibrated = p * (0.35 + 0.65 * cohesionRatio);
+      const minSimRequired = Math.max(0.18, intraSim * 0.45);
       return {
         categoryKey: lbl,
         displayName: artifact.displayMap[lbl] || lbl,
         rawProb: p,
         sim,
+        minSimRequired,
         calibrated: Number(Math.min(0.99, Math.max(0, calibrated)).toFixed(4)),
       };
     })
@@ -806,19 +732,20 @@ export function predictWithModelArtifact(
     displayName: null,
     rawProb: 0,
     sim: 0,
+    minSimRequired: 0.18,
     calibrated: 0,
   };
 
   const margin = Number((best.calibrated - second.calibrated).toFixed(4));
 
-  // Critérios de rejeição / encaminhamento para revisão manual:
+  // Critérios estritos de encaminhamento para revisão manual:
   // 1. Confiança calibrada abaixo de minConfidence
-  // 2. Margem entre a 1ª e a 2ª categoria menor que minMargin (ambiguidade ex: Fatura vs Nota de Crédito)
-  // 3. Similaridade cosseno ao centróide muito baixa (documento fora da distribuição conhecida)
+  // 2. Margem entre a 1ª e a 2ª categoria menor que minMargin (ambiguidade)
+  // 3. Similaridade cosseno ao centróide abaixo do limiar adaptativo da classe (proteção Open-Set / categoria desconhecida)
   if (
     best.calibrated < minConfidence ||
     margin < minMargin ||
-    best.sim < 0.10
+    best.sim < best.minSimRequired
   ) {
     return {
       status: 'needs_review',

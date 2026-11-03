@@ -39,6 +39,7 @@ export interface AppConfig {
   classifierDataDir: string;
   classifierDbPath: string;
   classifierMinExamplesPerCategory: number;
+  classifierMinCategoriesForModel: number;
   classifierMinTextChars: number;
   classifierMaxFeatureChars: number;
   classifierMaxFeaturePages: number;
@@ -127,6 +128,10 @@ export const config: AppConfig = {
   classifierMinExamplesPerCategory: parsePositiveInt(
     process.env.CLASSIFIER_MIN_EXAMPLES_PER_CATEGORY,
     10
+  ),
+  classifierMinCategoriesForModel: parsePositiveInt(
+    process.env.CLASSIFIER_MIN_CATEGORIES_FOR_MODEL,
+    2
   ),
   classifierMinTextChars: parsePositiveInt(
     process.env.CLASSIFIER_MIN_TEXT_CHARS,
