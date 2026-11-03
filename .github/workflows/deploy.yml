@@ -44,12 +44,29 @@ jobs:
             docker image prune -f
 
             echo "=== 6. Validando Healthcheck Direto e via Nginx ==="
-            sleep 3
             PORT_VAL=$(grep -E '^PORT=' .env | cut -d '=' -f2 | tr -d '\r' || echo "3014")
-            echo -n "Direto (porta ${PORT_VAL:-3014}): "
-            curl --fail -s "http://localhost:${PORT_VAL:-3014}/health"
+            PORT_NUM="${PORT_VAL:-3014}"
+            echo -n "Aguardando inicialização na porta ${PORT_NUM}..."
+            HEALTHY=false
+            for i in $(seq 1 15); do
+              if curl -s -f "http://127.0.0.1:${PORT_NUM}/health" > /dev/null 2>&1; then
+                HEALTHY=true
+                break
+              fi
+              sleep 2
+              echo -n "."
+            done
             echo ""
+            if [ "$HEALTHY" = "true" ]; then
+              echo -n "Direto (porta ${PORT_NUM}): "
+              curl --fail -s "http://127.0.0.1:${PORT_NUM}/health"
+              echo ""
+            else
+              echo "Falha no healthcheck direto após 30 segundos. Verificando logs do container:"
+              docker logs --tail 40 docuware-ai-gateway
+              exit 1
+            fi
             echo -n "Via Nginx (wp.processcloud.app/ai-gateway/health): "
-            curl -s -H "Host: wp.processcloud.app" "http://localhost/ai-gateway/health" || true
+            curl -s -H "Host: wp.processcloud.app" "http://127.0.0.1/ai-gateway/health" || true
             echo ""
             echo "=== Deploy concluído com sucesso! ==="

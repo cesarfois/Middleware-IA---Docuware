@@ -225,7 +225,11 @@ export class ClassifierService {
     if (pending.length > 0) {
       this.scheduleWorkerPump();
     } else if (this.needsStartupModelEvaluation()) {
-      void this.evaluateAndTrainModelIfNeeded();
+      setImmediate(() => {
+        void this.evaluateAndTrainModelIfNeeded().catch((err) => {
+          console.error('[ClassifierService] Erro na reavaliação de inicialização:', err);
+        });
+      });
     }
     return recoveredCount;
   }

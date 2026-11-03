@@ -377,11 +377,11 @@ function fitMultinomialLogReg(
  * Treinador nativo em TypeScript (TF-IDF unigramas/bigramas/trigramas + Regressão Logística Multinomial L2 Balanceada
  * + Validação Cruzada Estratificada 5-Fold sem vazamento entre folds e com matriz de confusão consistente).
  */
-function trainAndValidateInNode(
+async function trainAndValidateInNode(
   samples: TrainingSampleInput[],
   minConfidence: number,
   minMargin: number
-): TrainingExecutionOutput {
+): Promise<TrainingExecutionOutput> {
   const displayMap: Record<string, string> = {};
   for (const s of samples) {
     displayMap[s.categoryKey] = s.displayName;
@@ -437,6 +437,7 @@ function trainAndValidateInNode(
   let reviewCount = 0;
 
   for (let f = 0; f < kFolds; f++) {
+    await new Promise((resolve) => setImmediate(resolve));
     const valSet = new Set(folds[f]);
     if (valSet.size === 0) continue;
 
