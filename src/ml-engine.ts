@@ -17,6 +17,7 @@ export interface TrainingSampleInput {
 
 export interface TrainedModelArtifact {
   engine: 'python_sklearn' | 'node_tfidf_logreg';
+  trainedAt?: string;
   labels: string[];
   displayMap: Record<string, string>;
   terms: string[];
@@ -567,6 +568,7 @@ function trainAndValidateInNode(
     },
     artifact: {
       engine: 'node_tfidf_logreg',
+      trainedAt: new Date().toISOString(),
       labels: uniqueLabels,
       displayMap,
       terms: sortedTerms,
