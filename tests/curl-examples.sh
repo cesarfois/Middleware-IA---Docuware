@@ -11,6 +11,8 @@ GATEWAY_URL="${GATEWAY_URL:-https://wp.processcloud.app/ai-gateway/extract}"
 TEXTSHOT_URL="${TEXTSHOT_URL:-https://wp.processcloud.app/ai-gateway/textshot}"
 TRAIN_URL="${TRAIN_URL:-https://wp.processcloud.app/ai-gateway/train}"
 TRAIN_STATUS_URL="${TRAIN_STATUS_URL:-https://wp.processcloud.app/ai-gateway/train/status}"
+TRAIN_SUMMARY_URL="${TRAIN_SUMMARY_URL:-https://wp.processcloud.app/ai-gateway/train/summary}"
+TRAIN_HISTORY_URL="${TRAIN_HISTORY_URL:-https://wp.processcloud.app/ai-gateway/train/history}"
 CLASSIFY_URL="${CLASSIFY_URL:-https://wp.processcloud.app/ai-gateway/classify}"
 HEALTH_URL="${HEALTH_URL:-https://wp.processcloud.app/ai-gateway/health}"
 API_TOKEN="${API_AUTH_TOKEN:-<SEU_TOKEN_SECRETO_DOCUWARE>}"
@@ -121,6 +123,16 @@ if [ -n "${DOCUWARE_CABINET_ID:-}" ] && [ -n "${DOCUWARE_DOCUMENT_ID:-}" ]; then
 
   echo "=== 6ª Execução (/train/status): Consultando estado do trabalho de aprendizagem ==="
   curl -s "${TRAIN_STATUS_URL}?trainingId=trn-000001" \
+    -H "X-DocuWare-Token: $API_TOKEN"
+  echo -e "\n"
+
+  echo "=== 6.1ª Execução (/train/summary): Consultando resumo geral e métricas do modelo ==="
+  curl -s "$TRAIN_SUMMARY_URL" \
+    -H "X-DocuWare-Token: $API_TOKEN"
+  echo -e "\n"
+
+  echo "=== 6.2ª Execução (/train/history): Consultando histórico paginado de treinamento ==="
+  curl -s "${TRAIN_HISTORY_URL}?limit=20" \
     -H "X-DocuWare-Token: $API_TOKEN"
   echo -e "\n"
 

@@ -203,6 +203,14 @@ export type TrainingJobStatus =
   | 'rejected'
   | 'failed';
 
+export type TrainingOperationType =
+  | 'pending'
+  | 'new_example'
+  | 'idempotent_duplicate'
+  | 'label_correction'
+  | 'rejected'
+  | 'failed';
+
 export type CategoryStatus = 'pending_validation' | 'active';
 
 export type ClassifierErrorCode =
@@ -259,8 +267,10 @@ export interface TrainStatusResponse {
     textshotRetrieved: boolean;
     exampleStored: boolean;
     includedInModel: boolean;
+    isIdempotentDuplicate?: boolean;
     wasCorrection: boolean;
     previousDocumentType: string | null;
+    operationType?: TrainingOperationType;
     attempts: number;
     errorCode: string | null;
     errorMessage: string | null;
@@ -269,6 +279,91 @@ export interface TrainStatusResponse {
     completedAt: string | null;
   };
   message: string;
+}
+
+export interface TrainSummaryCategoryItem {
+  documentType: string;
+  status: CategoryStatus;
+  examplesReceived: number;
+  minimumExamples: number;
+  examplesIncludedInModel: number;
+  pendingExamples: number;
+  active: boolean;
+  validation: {
+    precision: number;
+    recall: number;
+    f1: number;
+  } | null;
+  lastExampleAt: string | null;
+}
+
+export interface TrainSummaryResponse {
+  success: true;
+  model: {
+    version: string | null;
+    status: 'active' | 'not_ready' | 'unavailable';
+    engine: 'python_sklearn' | 'node_tfidf_logreg' | null;
+    trainedAt: string | null;
+    activatedAt: string | null;
+    validation: {
+      accuracy: number;
+      macroF1: number;
+      weightedF1: number;
+    } | null;
+  };
+  summary: {
+    totalCategories: number;
+    activeCategories: number;
+    pendingCategories: number;
+    eligibleCategories: number;
+    totalExamples: number;
+    learnedExamples: number;
+    pendingExamples: number;
+    totalTrainingJobs: number;
+    completedJobs: number;
+    pendingJobs: number;
+    failedJobs: number;
+    rejectedJobs: number;
+  };
+  categories: TrainSummaryCategoryItem[];
+}
+
+export interface TrainHistoryQueryParams {
+  documentType?: string;
+  status?: string;
+  from?: string;
+  to?: string;
+  limit?: string | number;
+  cursor?: string;
+}
+
+export interface TrainHistoryItem {
+  trainingId: string;
+  fileCabinetId: string;
+  documentId: number;
+  documentType: string;
+  status: TrainingJobStatus;
+  jobFinished: boolean;
+  operationType: TrainingOperationType;
+  isIdempotentDuplicate: boolean;
+  includedInModel: boolean;
+  modelVersion: string | null;
+  wasCorrection: boolean;
+  previousDocumentType: string | null;
+  attempts: number;
+  errorCode: string | null;
+  createdAt: string;
+  completedAt: string | null;
+}
+
+export interface TrainHistoryResponse {
+  success: true;
+  totalMatching: number;
+  count: number;
+  limit: number;
+  nextCursor: string | null;
+  hasMore: boolean;
+  items: TrainHistoryItem[];
 }
 
 export interface ClassifyRequestBody {

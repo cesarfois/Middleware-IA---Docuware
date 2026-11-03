@@ -16,10 +16,12 @@ Middleware corporativo containerizado em **Node.js (TypeScript + Fastify)** para
 | **Textshot Nativo (DocuWare Platform API)** | `POST` | `https://wp.processcloud.app/ai-gateway/textshot` | `http://127.0.0.1:3014/textshot` |
 | **Aprendizagem Supervisionada Local (1 doc)** | `POST` | `https://wp.processcloud.app/ai-gateway/train` | `http://127.0.0.1:3014/train` |
 | **Consulta de Estado da Aprendizagem** | `GET` | `https://wp.processcloud.app/ai-gateway/train/status` | `http://127.0.0.1:3014/train/status` |
+| **Resumo Geral e Métricas do Treinamento** | `GET` | `https://wp.processcloud.app/ai-gateway/train/summary` | `http://127.0.0.1:3014/train/summary` |
+| **Histórico Paginado de Treinamento** | `GET` | `https://wp.processcloud.app/ai-gateway/train/history` | `http://127.0.0.1:3014/train/history` |
 | **Classificação Automática Local** | `POST` | `https://wp.processcloud.app/ai-gateway/classify` | `http://127.0.0.1:3014/classify` |
 | **Healthcheck de Monitoramento** | `GET` | `https://wp.processcloud.app/ai-gateway/health` | `http://127.0.0.1:3014/health` |
 
-* **Cabeçalho de Autenticação (obrigatório em `/extract`, `/textshot`, `/train`, `/train/status` e `/classify`):**
+* **Cabeçalho de Autenticação (obrigatório em `/extract`, `/textshot`, `/train`, `/train/status`, `/train/summary`, `/train/history` e `/classify`):**
   * `X-DocuWare-Token: <SEU_TOKEN_SECRETO_DOCUWARE>` *(ou `Authorization: Bearer <SEU_TOKEN_SECRETO_DOCUWARE>`)*
 * **Isolamento de Rede:** A porta `3014` está restrita ao loopback (`127.0.0.1:3014`) e à rede interna Docker `reverse-proxy-network`, garantindo que todo o tráfego externo passe obrigatoriamente pelo proxy HTTPS (`portal_nginx`).
 
@@ -466,7 +468,165 @@ Quando a confiança calibrada é inferior a `0.70` (`CLASSIFIER_MIN_CONFIDENCE`)
 
 ---
 
-### 4.4. Relatório dos 16 Cenários Obrigatórios de Aprendizagem e Classificação
+### 4.4. Endpoint de Resumo Geral do Treinamento — `GET /ai-gateway/train/summary`
+
+Endpoint exclusivamente de leitura para monitorar todas as categorias documentais cadastradas, contagem real de exemplos únicos, estado de ativação, versão do modelo ativo e métricas reais de validação cruzada.
+
+* **Método:** `GET`
+* **Rota:** `/ai-gateway/train/summary` (aliases: `/train/summary`, `/api/train/summary`)
+* **Autenticação:** `X-DocuWare-Token` ou `Authorization: Bearer`
+
+#### Exemplo de Resposta (`HTTP 200 OK`)
+
+```json
+{
+  "success": true,
+  "model": {
+    "version": "v1.0.3",
+    "status": "active",
+    "engine": "node_tfidf_logreg",
+    "trainedAt": "2026-11-03T02:00:00.000Z",
+    "activatedAt": "2026-11-03T02:00:02.000Z",
+    "validation": {
+      "accuracy": 0.94,
+      "macroF1": 0.91,
+      "weightedF1": 0.93
+    }
+  },
+  "summary": {
+    "totalCategories": 3,
+    "activeCategories": 2,
+    "pendingCategories": 1,
+    "eligibleCategories": 2,
+    "totalExamples": 30,
+    "learnedExamples": 26,
+    "pendingExamples": 4,
+    "totalTrainingJobs": 32,
+    "completedJobs": 30,
+    "pendingJobs": 0,
+    "failedJobs": 1,
+    "rejectedJobs": 1
+  },
+  "categories": [
+    {
+      "documentType": "Fatura",
+      "status": "active",
+      "examplesReceived": 12,
+      "minimumExamples": 10,
+      "examplesIncludedInModel": 12,
+      "pendingExamples": 0,
+      "active": true,
+      "validation": {
+        "precision": 0.92,
+        "recall": 0.91,
+        "f1": 0.91
+      },
+      "lastExampleAt": "2026-11-03T01:40:00.000Z"
+    },
+    {
+      "documentType": "Ficha de Intervenção",
+      "status": "active",
+      "examplesReceived": 14,
+      "minimumExamples": 10,
+      "examplesIncludedInModel": 14,
+      "pendingExamples": 0,
+      "active": true,
+      "validation": {
+        "precision": 0.96,
+        "recall": 0.94,
+        "f1": 0.95
+      },
+      "lastExampleAt": "2026-11-03T01:30:00.000Z"
+    },
+    {
+      "documentType": "Nota de Crédito",
+      "status": "pending_validation",
+      "examplesReceived": 4,
+      "minimumExamples": 10,
+      "examplesIncludedInModel": 0,
+      "pendingExamples": 4,
+      "active": false,
+      "validation": null,
+      "lastExampleAt": "2026-11-03T01:50:00.000Z"
+    }
+  ]
+}
+```
+
+---
+
+### 4.5. Endpoint de Histórico de Treinamento — `GET /ai-gateway/train/history`
+
+Lista os trabalhos de treinamento ordenados do mais recente para o mais antigo (`createdAt` decrescente), sem expor texto OCR bruto ou dados sensíveis, distinguindo explicitamente entre **novo documento válido (`new_example`)**, **reenvio idempotente (`idempotent_duplicate`)**, **correção supervisionada de rótulo (`label_correction`)**, **rejeição (`rejected`)** e **falha (`failed`)**.
+
+* **Método:** `GET`
+* **Rota:** `/ai-gateway/train/history` (aliases: `/train/history`, `/api/train/history`)
+
+#### Parâmetros de Query Opcionais (`/train/history`)
+
+| Parâmetro | Tipo | Descrição |
+| :--- | :--- | :--- |
+| `documentType` | `string` | Filtra por categoria documental (ex.: `Ficha de Intervenção`). |
+| `status` | `string` | Filtra pelo estado do trabalho (`queued`, `processing`, `stored`, `learned`, `rejected`, `failed`). |
+| `from` | `string` | Data/hora inicial ISO 8601 (ex.: `2026-11-01` ou `2026-11-01T00:00:00Z`). |
+| `to` | `string` | Data/hora final ISO 8601 (ex.: `2026-11-03` ou `2026-11-03T23:59:59Z`). |
+| `limit` | `number` | Quantidade de itens por página (padrão: `50`, máximo: `200`). |
+| `cursor` | `string` | Cursor estável (`trainingId` retornado em `nextCursor` na página anterior). |
+
+#### Exemplo de Resposta (`HTTP 200 OK`)
+
+```json
+{
+  "success": true,
+  "totalMatching": 32,
+  "count": 2,
+  "limit": 2,
+  "nextCursor": "trn-000031",
+  "hasMore": true,
+  "items": [
+    {
+      "trainingId": "trn-000032",
+      "fileCabinetId": "04a67f02-e6a0-4370-aa96-ea2546332cae",
+      "documentId": 1010186,
+      "documentType": "Nota de Crédito",
+      "status": "stored",
+      "jobFinished": true,
+      "operationType": "label_correction",
+      "isIdempotentDuplicate": false,
+      "includedInModel": false,
+      "modelVersion": null,
+      "wasCorrection": true,
+      "previousDocumentType": "Fatura",
+      "attempts": 1,
+      "errorCode": null,
+      "createdAt": "2026-11-03T01:55:00.000Z",
+      "completedAt": "2026-11-03T01:55:01.000Z"
+    },
+    {
+      "trainingId": "trn-000031",
+      "fileCabinetId": "04a67f02-e6a0-4370-aa96-ea2546332cae",
+      "documentId": 1010185,
+      "documentType": "Ficha de Intervenção",
+      "status": "learned",
+      "jobFinished": true,
+      "operationType": "new_example",
+      "isIdempotentDuplicate": false,
+      "includedInModel": true,
+      "modelVersion": "v1.0.3",
+      "wasCorrection": false,
+      "previousDocumentType": null,
+      "attempts": 1,
+      "errorCode": null,
+      "createdAt": "2026-11-03T01:50:00.000Z",
+      "completedAt": "2026-11-03T01:50:02.000Z"
+    }
+  ]
+}
+```
+
+---
+
+### 4.6. Relatório dos 17 Cenários Obrigatórios de Aprendizagem, Monitoramento e Classificação
 
 Validados automaticamente na suíte [`src/tests/classifier.test.ts`](src/tests/classifier.test.ts) durante cada build Docker:
 
@@ -488,6 +648,7 @@ Validados automaticamente na suíte [`src/tests/classifier.test.ts`](src/tests/c
 | **14** | Classificar documento inexistente no DocuWare | Retorna `404 DOCUMENT_NOT_FOUND` estruturado. |
 | **15** | Simular reinício do serviço com trabalhos `processing` na fila | `recoverAndResumeQueue()` recupera os trabalhos do disco (`/app/data`) e conclui a aprendizagem. |
 | **16** | Confirmar que `/extract` e `/textshot` (incluindo excerto de 2.000 chars) continuam operacionais | Ambos os contratos e rotas funcionam sem qualquer regressão. |
+| **17** | Consultar `/train/summary` e `/train/history` com filtros e paginação estável por cursor | Retorna métricas reais (`accuracy`, `macroF1`, `weightedF1`), contagens por categoria e histórico distinguindo `new_example`, `idempotent_duplicate`, `label_correction`, `rejected` e `failed`. |
 
 ---
 

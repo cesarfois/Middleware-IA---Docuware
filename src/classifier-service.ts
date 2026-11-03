@@ -17,9 +17,16 @@ import type {
   ClassifyResponse,
   NormalizedClassifyRequest,
   NormalizedTrainRequest,
+  TrainHistoryItem,
+  TrainHistoryQueryParams,
+  TrainHistoryResponse,
   TrainImmediateResponse,
   TrainRequestBody,
   TrainStatusResponse,
+  TrainSummaryCategoryItem,
+  TrainSummaryResponse,
+  TrainingJobStatus,
+  TrainingOperationType,
 } from './types.js';
 
 export class ClassifierValidationError extends Error {
@@ -300,8 +307,22 @@ export class ClassifierService {
         textshotRetrieved: job.textshotRetrieved,
         exampleStored: job.exampleStored,
         includedInModel: job.includedInModel,
+        isIdempotentDuplicate: Boolean(job.isIdempotentDuplicate),
         wasCorrection: job.wasCorrection,
         previousDocumentType: job.previousDocumentType,
+        operationType:
+          job.operationType ??
+          (job.status === 'rejected'
+            ? 'rejected'
+            : job.status === 'failed'
+            ? 'failed'
+            : !isTerminalStatus
+            ? 'pending'
+            : job.wasCorrection
+            ? 'label_correction'
+            : job.isIdempotentDuplicate
+            ? 'idempotent_duplicate'
+            : 'new_example'),
         attempts: job.attempts,
         errorCode: job.errorCode,
         errorMessage: job.errorMessage,
@@ -310,6 +331,393 @@ export class ClassifierService {
         completedAt: job.completedAt,
       },
       message: job.statusMessage,
+    };
+  }
+
+  /**
+   * Consulta o resumo geral do sistema de aprendizagem e do modelo ativo (`GET /train/summary`).
+   */
+  public getTrainingSummary(): TrainSummaryResponse {
+    const activeModel = this.store.getActiveModel();
+    const allCategories = this.store.getAllCategories();
+    const allExamples = this.store.getAllExamples();
+    const allJobs = this.store.getAllJobs();
+    const minExamples = config.classifierMinExamplesPerCategory;
+    const minCats = config.classifierMinCategoriesForModel;
+
+    const isModelActive = Boolean(
+      activeModel && activeModel.categories.length >= minCats
+    );
+
+    let modelValidation: {
+      accuracy: number;
+      macroF1: number;
+      weightedF1: number;
+    } | null = null;
+
+    if (isModelActive && activeModel) {
+      const perCatList = Object.values(activeModel.report.perCategory ?? {});
+      const totalSupport = perCatList.reduce(
+        (acc, c) => acc + (c.support ?? 0),
+        0
+      );
+      const weightedF1 =
+        totalSupport > 0
+          ? Number(
+              (
+                perCatList.reduce(
+                  (acc, c) => acc + (c.support ?? 0) * c.f1Score,
+                  0
+                ) / totalSupport
+              ).toFixed(4)
+            )
+          : activeModel.report.macroF1;
+
+      modelValidation = {
+        accuracy: activeModel.report.accuracy,
+        macroF1: activeModel.report.macroF1,
+        weightedF1,
+      };
+    }
+
+    const categoriesList: TrainSummaryCategoryItem[] = allCategories
+      .slice()
+      .sort((a, b) => a.displayName.localeCompare(b.displayName, 'pt'))
+      .map((cat) => {
+        const catExamples = allExamples.filter(
+          (ex) => ex.categoryKey === cat.categoryKey
+        );
+        const examplesReceived = catExamples.length;
+        const isCatActive = Boolean(
+          isModelActive &&
+            activeModel &&
+            activeModel.categories.includes(cat.categoryKey) &&
+            cat.status === 'active'
+        );
+        const examplesIncludedInModel = isCatActive
+          ? catExamples.filter(
+              (ex) =>
+                ex.status === 'learned' &&
+                ex.includedInModelVersion === activeModel!.version
+            ).length
+          : 0;
+        const pendingExamples = Math.max(
+          0,
+          examplesReceived - examplesIncludedInModel
+        );
+
+        const catReport =
+          isCatActive && activeModel
+            ? activeModel.report.perCategory[cat.categoryKey]
+            : undefined;
+
+        let lastExampleAt: string | null = null;
+        for (const ex of catExamples) {
+          const ts = ex.updatedAt || ex.createdAt;
+          if (!lastExampleAt || ts.localeCompare(lastExampleAt) > 0) {
+            lastExampleAt = ts;
+          }
+        }
+
+        return {
+          documentType: cat.displayName,
+          status: isCatActive ? 'active' : 'pending_validation',
+          examplesReceived,
+          minimumExamples: minExamples,
+          examplesIncludedInModel,
+          pendingExamples,
+          active: isCatActive,
+          validation: catReport
+            ? {
+                precision: catReport.precision,
+                recall: catReport.recall,
+                f1: catReport.f1Score,
+              }
+            : null,
+          lastExampleAt,
+        };
+      });
+
+    const totalCategories = categoriesList.length;
+    const activeCategories = categoriesList.filter((c) => c.active).length;
+    const pendingCategories = categoriesList.filter((c) => !c.active).length;
+    const eligibleCategories = categoriesList.filter(
+      (c) => c.examplesReceived >= minExamples
+    ).length;
+    const totalExamples = allExamples.length;
+    const learnedExamples = categoriesList.reduce(
+      (acc, c) => acc + c.examplesIncludedInModel,
+      0
+    );
+    const pendingExamples = Math.max(0, totalExamples - learnedExamples);
+
+    const totalTrainingJobs = allJobs.length;
+    const completedJobs = allJobs.filter(
+      (j) => j.status === 'learned' || j.status === 'stored'
+    ).length;
+    const pendingJobs = allJobs.filter(
+      (j) => j.status === 'queued' || j.status === 'processing'
+    ).length;
+    const failedJobs = allJobs.filter((j) => j.status === 'failed').length;
+    const rejectedJobs = allJobs.filter((j) => j.status === 'rejected').length;
+
+    return {
+      success: true,
+      model: {
+        version: isModelActive && activeModel ? activeModel.version : null,
+        status: isModelActive ? 'active' : 'not_ready',
+        engine:
+          isModelActive && activeModel
+            ? activeModel.report.engine
+            : config.classifierUsePythonEngine
+            ? 'python_sklearn'
+            : 'node_tfidf_logreg',
+        trainedAt:
+          isModelActive && activeModel
+            ? activeModel.trainedAt ??
+              activeModel.artifact.trainedAt ??
+              activeModel.createdAt
+            : null,
+        activatedAt:
+          isModelActive && activeModel
+            ? activeModel.activatedAt ?? activeModel.createdAt
+            : null,
+        validation: modelValidation,
+      },
+      summary: {
+        totalCategories,
+        activeCategories,
+        pendingCategories,
+        eligibleCategories,
+        totalExamples,
+        learnedExamples,
+        pendingExamples,
+        totalTrainingJobs,
+        completedJobs,
+        pendingJobs,
+        failedJobs,
+        rejectedJobs,
+      },
+      categories: categoriesList,
+    };
+  }
+
+  /**
+   * Consulta o histórico paginado e filtrado de trabalhos de treinamento (`GET /train/history`).
+   */
+  public getTrainingHistory(
+    rawParams: TrainHistoryQueryParams = {}
+  ): TrainHistoryResponse {
+    const validStatuses: Set<TrainingJobStatus> = new Set([
+      'queued',
+      'processing',
+      'stored',
+      'learned',
+      'rejected',
+      'failed',
+    ]);
+
+    let statusFilter: TrainingJobStatus | null = null;
+    if (
+      rawParams.status !== undefined &&
+      String(rawParams.status).trim() !== ''
+    ) {
+      const s = String(rawParams.status).trim() as TrainingJobStatus;
+      if (!validStatuses.has(s)) {
+        throw new ClassifierValidationError(
+          'INVALID_REQUEST',
+          'O parâmetro "status" deve ser um dos valores: queued, processing, stored, learned, rejected, failed.',
+          400
+        );
+      }
+      statusFilter = s;
+    }
+
+    let categoryKeyFilter: string | null = null;
+    if (
+      rawParams.documentType !== undefined &&
+      String(rawParams.documentType).trim() !== ''
+    ) {
+      const normalized = normalizeCategoryName(String(rawParams.documentType));
+      if (!normalized.categoryKey) {
+        throw new ClassifierValidationError(
+          'INVALID_REQUEST',
+          'O parâmetro "documentType" informado é inválido.',
+          400
+        );
+      }
+      categoryKeyFilter = normalized.categoryKey;
+    }
+
+    let fromMs: number | null = null;
+    if (rawParams.from !== undefined && String(rawParams.from).trim() !== '') {
+      const parsed = Date.parse(String(rawParams.from).trim());
+      if (Number.isNaN(parsed)) {
+        throw new ClassifierValidationError(
+          'INVALID_REQUEST',
+          'O parâmetro "from" deve ser uma data ISO 8601 válida.',
+          400
+        );
+      }
+      fromMs = parsed;
+    }
+
+    let toMs: number | null = null;
+    if (rawParams.to !== undefined && String(rawParams.to).trim() !== '') {
+      const rawTo = String(rawParams.to).trim();
+      const parsed = Date.parse(rawTo);
+      if (Number.isNaN(parsed)) {
+        throw new ClassifierValidationError(
+          'INVALID_REQUEST',
+          'O parâmetro "to" deve ser uma data ISO 8601 válida.',
+          400
+        );
+      }
+      toMs = /^\d{4}-\d{2}-\d{2}$/.test(rawTo) ? parsed + 86_399_999 : parsed;
+    }
+
+    if (fromMs !== null && toMs !== null && fromMs > toMs) {
+      throw new ClassifierValidationError(
+        'INVALID_REQUEST',
+        'O parâmetro "from" não pode ser posterior a "to".',
+        400
+      );
+    }
+
+    let limit = 50;
+    if (
+      rawParams.limit !== undefined &&
+      String(rawParams.limit).trim() !== ''
+    ) {
+      const rawLimit = String(rawParams.limit).trim();
+      if (!/^\d+$/.test(rawLimit)) {
+        throw new ClassifierValidationError(
+          'INVALID_REQUEST',
+          'O parâmetro "limit" deve ser um número inteiro entre 1 e 200.',
+          400
+        );
+      }
+      const parsedLimit = Number.parseInt(rawLimit, 10);
+      if (parsedLimit < 1 || parsedLimit > 200) {
+        throw new ClassifierValidationError(
+          'INVALID_REQUEST',
+          'O parâmetro "limit" deve estar entre 1 e 200.',
+          400
+        );
+      }
+      limit = parsedLimit;
+    }
+
+    let cursorJob: { createdAt: string; trainingId: string } | null = null;
+    if (
+      rawParams.cursor !== undefined &&
+      String(rawParams.cursor).trim() !== ''
+    ) {
+      const cleanCursor = String(rawParams.cursor).trim();
+      const existingCursorJob = this.store.getTrainingJob(cleanCursor);
+      if (!existingCursorJob) {
+        throw new ClassifierValidationError(
+          'INVALID_REQUEST',
+          `Cursor de paginação "${cleanCursor}" inválido ou inexistente.`,
+          400
+        );
+      }
+      cursorJob = {
+        createdAt: existingCursorJob.createdAt,
+        trainingId: existingCursorJob.trainingId,
+      };
+    }
+
+    const filteredJobs = this.store
+      .getAllJobs()
+      .filter((job) => {
+        if (categoryKeyFilter && job.categoryKey !== categoryKeyFilter) {
+          return false;
+        }
+        if (statusFilter && job.status !== statusFilter) {
+          return false;
+        }
+        if (fromMs !== null || toMs !== null) {
+          const jobTime = Date.parse(job.createdAt);
+          if (fromMs !== null && jobTime < fromMs) return false;
+          if (toMs !== null && jobTime > toMs) return false;
+        }
+        return true;
+      })
+      .sort((a, b) => {
+        const cmpDate = b.createdAt.localeCompare(a.createdAt);
+        if (cmpDate !== 0) return cmpDate;
+        return b.trainingId.localeCompare(a.trainingId);
+      });
+
+    const totalMatching = filteredJobs.length;
+
+    const afterCursorJobs = cursorJob
+      ? filteredJobs.filter((job) => {
+          const cmpDate = job.createdAt.localeCompare(cursorJob!.createdAt);
+          if (cmpDate < 0) return true;
+          if (cmpDate > 0) return false;
+          return job.trainingId.localeCompare(cursorJob!.trainingId) < 0;
+        })
+      : filteredJobs;
+
+    const pageJobs = afterCursorJobs.slice(0, limit);
+    const hasMore = afterCursorJobs.length > limit;
+    const nextCursor =
+      hasMore && pageJobs.length > 0
+        ? pageJobs[pageJobs.length - 1]!.trainingId
+        : null;
+
+    const items: TrainHistoryItem[] = pageJobs.map((job) => {
+      const jobFinished =
+        job.status === 'stored' ||
+        job.status === 'learned' ||
+        job.status === 'rejected' ||
+        job.status === 'failed';
+
+      const isIdempotentDuplicate = Boolean(job.isIdempotentDuplicate);
+      const operationType: TrainingOperationType =
+        job.operationType ??
+        (job.status === 'rejected'
+          ? 'rejected'
+          : job.status === 'failed'
+          ? 'failed'
+          : !jobFinished
+          ? 'pending'
+          : job.wasCorrection
+          ? 'label_correction'
+          : isIdempotentDuplicate
+          ? 'idempotent_duplicate'
+          : 'new_example');
+
+      return {
+        trainingId: job.trainingId,
+        fileCabinetId: job.fileCabinetId,
+        documentId: job.documentId,
+        documentType: job.displayName,
+        status: job.status,
+        jobFinished,
+        operationType,
+        isIdempotentDuplicate,
+        includedInModel: job.includedInModel,
+        modelVersion: job.modelVersion ?? null,
+        wasCorrection: job.wasCorrection,
+        previousDocumentType: job.previousDocumentType ?? null,
+        attempts: job.attempts,
+        errorCode: job.errorCode ?? null,
+        createdAt: job.createdAt,
+        completedAt: job.completedAt ?? null,
+      };
+    });
+
+    return {
+      success: true,
+      totalMatching,
+      count: items.length,
+      limit,
+      nextCursor,
+      hasMore,
+      items,
     };
   }
 
@@ -566,6 +974,9 @@ export class ClassifierService {
             textshotRetrieved: true,
             exampleStored: false,
             includedInModel: false,
+            isIdempotentDuplicate: false,
+            wasCorrection: false,
+            operationType: 'rejected',
             errorCode: 'INSUFFICIENT_OCR_TEXT',
             errorMessage: rejectMsg,
             statusMessage: rejectMsg,
@@ -603,6 +1014,12 @@ export class ClassifierService {
           .getAllCategories()
           .filter((c) => c.examplesCount >= minReq).length;
 
+        const jobOperationType: TrainingOperationType = upsertResult.wasCorrection
+          ? 'label_correction'
+          : upsertResult.isDuplicateSameCategory
+          ? 'idempotent_duplicate'
+          : 'new_example';
+
         // Se for duplicado idempotente e o exemplo já estiver learned no modelo ativo
         if (
           upsertResult.isDuplicateSameCategory &&
@@ -615,6 +1032,9 @@ export class ClassifierService {
             textshotRetrieved: true,
             exampleStored: true,
             includedInModel: true,
+            isIdempotentDuplicate: true,
+            wasCorrection: false,
+            operationType: 'idempotent_duplicate',
             modelVersion: upsertResult.example.includedInModelVersion,
             validationAccuracy: activeModel?.report.accuracy ?? null,
             errorCode: null,
@@ -640,8 +1060,10 @@ export class ClassifierService {
           textshotRetrieved: true,
           exampleStored: true,
           includedInModel: false,
+          isIdempotentDuplicate: upsertResult.isDuplicateSameCategory,
           wasCorrection: upsertResult.wasCorrection,
           previousDocumentType: upsertResult.previousDisplayName,
+          operationType: jobOperationType,
           errorCode: null,
           errorMessage: null,
           statusMessage: baseStoredMsg,
@@ -687,6 +1109,9 @@ export class ClassifierService {
       status: 'failed',
       exampleStored: false,
       includedInModel: false,
+      isIdempotentDuplicate: false,
+      wasCorrection: false,
+      operationType: 'failed',
       errorCode: errCode,
       errorMessage: errMsg,
       statusMessage: `Falha ao processar exemplo: ${errMsg}`,

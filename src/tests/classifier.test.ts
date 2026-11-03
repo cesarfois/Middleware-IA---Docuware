@@ -610,6 +610,9 @@ describe('Sistema de Aprendizagem Supervisionada e Classificação Automática L
     );
     assert.equal(statusAfterRestart.status, 'learned');
     assert.equal(statusAfterRestart.details.textshotRetrieved, true);
+
+    // Sincroniza a instância principal em memória com o estado gravado em disco pelo serviço reiniciado
+    store.reloadFromDisk();
   });
 
   it('Cenário 16: Deve confirmar que os contratos e funções de /textshot (excerto de 2000 caracteres) e /extract continuam operacionais', () => {
@@ -647,5 +650,166 @@ describe('Sistema de Aprendizagem Supervisionada e Classificação Automática L
         err instanceof ClassifierValidationError &&
         err.code === 'INVALID_REQUEST'
     );
+  });
+
+  it('Cenário 17: Deve consultar /train/summary e /train/history com métricas reais, filtros, paginação por cursor e distinção entre novo exemplo, duplicado idempotente e correção', async () => {
+    const cab = 'fc-monitor-001';
+
+    // 1. Adiciona 2 exemplos de uma nova categoria pendente ("Guia de Remessa" - apenas 2/10 exemplos)
+    for (let i = 1; i <= 2; i++) {
+      const docId = 9500 + i;
+      mockDocuments.set(
+        `${cab}:${docId}`,
+        `GUIA DE REMESSA LOGÍSTICA Nº GR-${docId}. Transporte de mercadoria e equipamento técnico entregue em Luanda.`
+      );
+      service.enqueueTrainingDocument(
+        validateAndNormalizeTrainRequest({
+          fileCabinetId: cab,
+          documentId: docId,
+          documentType: 'Guia de Remessa',
+        })
+      );
+    }
+
+    // 2. Adiciona 1 documento com OCR insuficiente -> 'rejected'
+    mockDocuments.set(`${cab}:9601`, 'ok');
+    service.enqueueTrainingDocument(
+      validateAndNormalizeTrainRequest({
+        fileCabinetId: cab,
+        documentId: 9601,
+        documentType: 'Guia de Remessa',
+      })
+    );
+
+    // 3. Adiciona 1 documento inexistente -> 'failed'
+    service.enqueueTrainingDocument(
+      validateAndNormalizeTrainRequest({
+        fileCabinetId: cab,
+        documentId: 9699,
+        documentType: 'Guia de Remessa',
+      })
+    );
+
+    await service.waitForIdle();
+
+    // Consulta o resumo geral (/train/summary)
+    const summaryRes = service.getTrainingSummary();
+    assert.equal(summaryRes.success, true);
+    assert.equal(summaryRes.model.status, 'active');
+    assert.equal(summaryRes.model.engine, 'node_tfidf_logreg');
+    assert.ok(summaryRes.model.version?.startsWith('v1.0.'));
+    assert.ok(summaryRes.model.trainedAt);
+    assert.ok(summaryRes.model.activatedAt);
+    assert.ok(summaryRes.model.validation);
+    assert.ok(summaryRes.model.validation.accuracy >= 0.75);
+    assert.ok(summaryRes.model.validation.macroF1 >= 0.75);
+    assert.ok(summaryRes.model.validation.weightedF1 >= 0.75);
+
+    // 5 categorias ativas (Ficha de Intervenção, Contrato, Fatura, Nota de Crédito, Fatura de Adiantamento)
+    // + 2 categorias pendentes (Relatório Técnico do Cenário 3 com 0 exemplos e Guia de Remessa com 2 exemplos)
+    assert.equal(summaryRes.summary.activeCategories, 5);
+    assert.equal(summaryRes.summary.pendingCategories, 2);
+    assert.equal(summaryRes.summary.totalCategories, 7);
+    assert.equal(summaryRes.summary.eligibleCategories, 5);
+    assert.equal(summaryRes.summary.pendingExamples, 2);
+    assert.equal(
+      summaryRes.summary.totalExamples,
+      summaryRes.summary.learnedExamples + summaryRes.summary.pendingExamples
+    );
+    assert.ok(summaryRes.summary.rejectedJobs >= 1);
+    assert.ok(summaryRes.summary.failedJobs >= 1);
+
+    const guiaCat = summaryRes.categories.find(
+      (c) => c.documentType === 'Guia de Remessa'
+    );
+    assert.ok(guiaCat);
+    assert.equal(guiaCat.status, 'pending_validation');
+    assert.equal(guiaCat.examplesReceived, 2);
+    assert.equal(guiaCat.examplesIncludedInModel, 0);
+    assert.equal(guiaCat.pendingExamples, 2);
+    assert.equal(guiaCat.active, false);
+    assert.equal(guiaCat.validation, null);
+    assert.ok(guiaCat.lastExampleAt);
+
+    const fichaCat = summaryRes.categories.find(
+      (c) => c.documentType === 'Ficha de Intervenção'
+    );
+    assert.ok(fichaCat);
+    assert.equal(fichaCat.status, 'active');
+    assert.equal(fichaCat.active, true);
+    assert.ok(fichaCat.examplesIncludedInModel >= 10);
+    assert.equal(fichaCat.pendingExamples, 0);
+    assert.ok(fichaCat.validation);
+    assert.ok(fichaCat.validation.f1 >= 0.75);
+
+    // Consulta o histórico (/train/history) com paginação por cursor
+    const page1 = service.getTrainingHistory({ limit: 5 });
+    assert.equal(page1.success, true);
+    assert.equal(page1.count, 5);
+    assert.equal(page1.limit, 5);
+    assert.equal(page1.hasMore, true);
+    assert.ok(page1.nextCursor);
+
+    const page2 = service.getTrainingHistory({
+      limit: 5,
+      cursor: page1.nextCursor!,
+    });
+    assert.equal(page2.count, 5);
+    assert.notEqual(page1.items[0]!.trainingId, page2.items[0]!.trainingId);
+
+    // Verifica que nenhum item contém texto OCR bruto
+    const fullHistory = service.getTrainingHistory({ limit: 200 });
+    for (const item of fullHistory.items) {
+      assert.equal('normalizedText' in item, false);
+      assert.equal('text' in item, false);
+    }
+
+    // Verifica distinção entre novo documento válido, duplicado idempotente, correção, rejeitado e falha
+    const idempotentItem = fullHistory.items.find(
+      (i) => i.trainingId === 'trn-000002'
+    );
+    assert.ok(idempotentItem);
+    assert.equal(idempotentItem.isIdempotentDuplicate, true);
+    assert.equal(idempotentItem.operationType, 'idempotent_duplicate');
+    assert.equal(idempotentItem.wasCorrection, false);
+
+    const correctionItem = fullHistory.items.find(
+      (i) => i.trainingId === 'trn-000003'
+    );
+    assert.ok(correctionItem);
+    assert.equal(correctionItem.wasCorrection, true);
+    assert.equal(correctionItem.previousDocumentType, 'Ficha de Intervenção');
+    assert.equal(correctionItem.operationType, 'label_correction');
+    assert.equal(correctionItem.isIdempotentDuplicate, false);
+
+    const newExampleItem = fullHistory.items.find(
+      (i) => i.trainingId === 'trn-000001'
+    );
+    assert.ok(newExampleItem);
+    assert.equal(newExampleItem.operationType, 'new_example');
+    assert.equal(newExampleItem.isIdempotentDuplicate, false);
+    assert.equal(newExampleItem.wasCorrection, false);
+
+    // Testa filtros por status e documentType
+    const rejectedHistory = service.getTrainingHistory({ status: 'rejected' });
+    assert.ok(rejectedHistory.items.length >= 1);
+    assert.ok(
+      rejectedHistory.items.every(
+        (i) => i.status === 'rejected' && i.operationType === 'rejected'
+      )
+    );
+
+    const failedHistory = service.getTrainingHistory({ status: 'failed' });
+    assert.ok(failedHistory.items.length >= 1);
+    assert.ok(
+      failedHistory.items.every(
+        (i) => i.status === 'failed' && i.operationType === 'failed'
+      )
+    );
+
+    const guiaHistory = service.getTrainingHistory({
+      documentType: 'Guia de Remessa',
+    });
+    assert.equal(guiaHistory.totalMatching, 4);
   });
 });

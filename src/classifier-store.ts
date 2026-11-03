@@ -6,6 +6,7 @@ import type {
   CategoryStatus,
   ModelValidationReport,
   TrainingJobStatus,
+  TrainingOperationType,
 } from './types.js';
 
 export interface StoredCategoryRecord {
@@ -45,8 +46,10 @@ export interface StoredTrainingJobRecord {
   textshotRetrieved: boolean;
   exampleStored: boolean;
   includedInModel: boolean;
+  isIdempotentDuplicate?: boolean;
   wasCorrection: boolean;
   previousDocumentType: string | null;
+  operationType?: TrainingOperationType;
   attempts: number;
   modelVersion: string | null;
   validationAccuracy: number | null;
@@ -65,6 +68,8 @@ export interface StoredModelRecord {
   categories: string[];
   report: ModelValidationReport;
   artifact: TrainedModelArtifact;
+  trainedAt?: string;
+  activatedAt?: string;
   createdAt: string;
 }
 
@@ -295,8 +300,10 @@ export class ClassifierStore {
       textshotRetrieved: false,
       exampleStored: false,
       includedInModel: false,
+      isIdempotentDuplicate: false,
       wasCorrection: false,
       previousDocumentType: null,
+      operationType: 'pending',
       attempts: 0,
       modelVersion: null,
       validationAccuracy: null,
@@ -315,6 +322,10 @@ export class ClassifierStore {
 
   public getTrainingJob(trainingId: string): StoredTrainingJobRecord | null {
     return this.state.jobs[trainingId] ?? null;
+  }
+
+  public getAllJobs(): StoredTrainingJobRecord[] {
+    return Object.values(this.state.jobs);
   }
 
   public updateTrainingJob(
@@ -444,6 +455,19 @@ export class ClassifierStore {
       existing.includedInModelVersion = null;
       existing.updatedAt = now;
 
+      // Trabalhos anteriores do mesmo documento com a categoria antiga deixam de estar incluídos no modelo ativo
+      for (const prevJob of Object.values(this.state.jobs)) {
+        if (
+          prevJob.trainingId !== params.trainingId &&
+          prevJob.fileCabinetId === params.fileCabinetId &&
+          prevJob.documentId === params.documentId &&
+          prevJob.categoryKey === prevCategoryKey
+        ) {
+          prevJob.includedInModel = false;
+          prevJob.updatedAt = now;
+        }
+      }
+
       this.recalculateCategoryCounts();
       this.recordAuditEvent({
         trainingId: params.trainingId,
@@ -548,6 +572,8 @@ export class ClassifierStore {
       categories: [...params.categories],
       report: params.report,
       artifact: params.artifact,
+      trainedAt: params.artifact.trainedAt ?? now,
+      activatedAt: now,
       createdAt: now,
     };
 
