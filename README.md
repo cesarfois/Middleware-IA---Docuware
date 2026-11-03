@@ -4,7 +4,7 @@ Middleware corporativo containerizado em **Node.js (TypeScript + Fastify)** para
 
 1. **`POST /ai-gateway/extract` (Extração Multimodal Orientada por Contrato JSON):** Envia o PDF ao provedor de IA (`openai`, `gemini` ou `openai_compatible`) seguindo **100% as instruções e o schema dinâmico enviados no JSON `requestData`** pelo DocuWare Workflow Designer, sem prompts de negócio ou schemas fixos no backend.
 2. **`POST /ai-gateway/textshot` (Recuperação de OCR Nativo DocuWare Platform API):** Recupera diretamente o **Textshot (texto OCR já processado pelo DocuWare)** via **DocuWare Platform REST API**, preservando a ordem de múltiplas seções e páginas, sem reprocessar o PDF e sem chamar a OpenAI.
-3. **`POST /ai-gateway/train`, `GET /ai-gateway/train/status`, `GET /ai-gateway/train/summary`, `GET /ai-gateway/train/history` e `POST /ai-gateway/classify` (Classificação Documental e Monitoramento com Aprendizagem Automática Local):** Motor local de Machine Learning supervisionado (**TF-IDF de unigramas/bigramas + Regressão Logística Multinomial Balanceada + Validação Cruzada Estratificada 5-Fold + Calibração Multiplicativa por Similaridade Cosseno aos Centróides**), executado **100% localmente na VPS**, sem qualquer chamada à OpenAI, Gemini ou serviços pagos.
+3. **`POST /ai-gateway/train`, `GET /ai-gateway/train/status`, `GET /ai-gateway/train/summary`, `GET /ai-gateway/train/history` e `POST /ai-gateway/classify` (Classificação Documental e Monitoramento com Aprendizagem Automática Local):** Motor local de Machine Learning supervisionado (**TF-IDF de n-gramas de palavras (1 a 3) + tokens de zona de cabeçalho + Regressão Logística Multinomial Balanceada + Validação Cruzada Estratificada 5-Fold + Calibração Multiplicativa por Similaridade Cosseno aos Centróides**), executado **100% localmente na VPS**, sem qualquer chamada à OpenAI, Gemini ou serviços pagos.
 
 ---
 
@@ -514,6 +514,31 @@ curl -s -X GET "https://wp.processcloud.app/ai-gateway/train/summary" \
 | `categories[].pendingExamples` | `number` | Exemplos desta categoria ainda não incorporados no modelo ativo. |
 | `categories[].validation` | `object \| null` | `{ precision, recall, f1 }` reais da categoria no 5-Fold CV (ou `null` se pendente). |
 | `categories[].lastExampleAt` | `string \| null` | Data/hora ISO 8601 do último exemplo válido recebido na categoria. |
+| `model.validation.confusionMatrix` | `object` | Matriz de confusão K×K da validação cruzada (`labels`, `matrix`): linhas = classe real, colunas = classe prevista. A soma total é igual ao número de exemplos avaliados. |
+| `trainingDiagnostics` | `object` | Diagnóstico persistido da **última tentativa** de treino (aprovada ou rejeitada): `lastAttemptAt`, `candidateCategories`, `candidateExamples`, `candidateValidation` (`accuracy`, `macroF1`, `weightedF1`, `perCategory`, `confusionMatrix`), `activationApproved`, `rejectionReasons`, `activeModelVersionBeforeAttempt`, `activeModelVersionAfterAttempt`. |
+| `categories[].activation` | `object` | Motivo do estado da categoria: `eligible`, `includedInLastCandidate`, `lastAttemptStatus` (`approved`, `rejected`, `pending`, `not_evaluated`), `reasonCode`, `reasonMessage`, `candidatePrecision`, `candidateRecall`, `candidateF1`, `requiredF1`. |
+
+#### Códigos `categories[].activation.reasonCode`
+
+| Código | Significado |
+| :--- | :--- |
+| `VALIDATED_AND_ACTIVE` | Categoria aprovada na validação cruzada e ativa no modelo. |
+| `INSUFFICIENT_EXAMPLES` | Menos de `CLASSIFIER_MIN_EXAMPLES_PER_CATEGORY` exemplos válidos. |
+| `INSUFFICIENT_ELIGIBLE_CATEGORIES` | Existem menos de 2 categorias elegíveis para treino discriminativo. |
+| `CATEGORY_F1_BELOW_THRESHOLD` | F1 da categoria no candidato abaixo de `CLASSIFIER_MIN_VALIDATION_F1`. |
+| `MACRO_F1_BELOW_THRESHOLD` | Macro-F1 global do candidato abaixo do mínimo. |
+| `MODEL_REGRESSION_PREVENTED` | Candidato com as mesmas categorias degradou o Macro-F1 acima de `CLASSIFIER_MAX_REGRESSION_DROP`. |
+| `CANDIDATE_MODEL_REJECTED` | Categoria aprovada individualmente, mas o modelo candidato não foi ativado. |
+| `PENDING_TRAINING_CYCLE` | Categoria elegível ainda não avaliada (ciclo agendado). |
+
+#### Regras de validação e ativação
+
+* O candidato é treinado com **todas** as categorias elegíveis. Cada categoria exige `F1 >= 0.75` e o Macro-F1 global `>= 0.75`.
+* A proteção contra regressão (`CLASSIFIER_MAX_REGRESSION_DROP`) só compara modelos com **o mesmo conjunto de categorias**; a expansão de 2 para 4 categorias não é bloqueada comparando Macro-F1 de cardinalidades diferentes.
+* Validação cruzada **5-Fold estratificada por grupo** (documentos com o mesmo `textHash` ficam no mesmo fold); vocabulário e IDF são construídos **apenas com o fold de treino** (sem *data leakage*).
+* A matriz de confusão regista sempre a classe prevista (top-1). Casos com baixa confiança/margem são contabilizados separadamente em `manualReviewRate` e não geram falsos negativos "fantasma".
+* Se uma categoria reprovar, as restantes aprovadas só originam nova versão se o modelo ativo ainda não as contiver totalmente aprendidas (evita inflação de versões).
+* No arranque, se existirem categorias elegíveis não avaliadas para o conjunto atual de dados ou métricas legadas inconsistentes, o serviço reavalia automaticamente o modelo **sem apagar exemplos nem histórico**.
 
 #### Exemplo de Resposta (`HTTP 200 OK`)
 
@@ -696,7 +721,7 @@ curl -s -X GET "https://wp.processcloud.app/ai-gateway/train/history?limit=20&cu
 
 ---
 
-### 4.6. Relatório dos 17 Cenários Obrigatórios de Aprendizagem, Monitoramento e Classificação
+### 4.6. Relatório dos 20 Cenários Obrigatórios de Aprendizagem, Monitoramento e Classificação
 
 Validados automaticamente na suíte [`src/tests/classifier.test.ts`](src/tests/classifier.test.ts) durante cada build Docker:
 
@@ -719,6 +744,9 @@ Validados automaticamente na suíte [`src/tests/classifier.test.ts`](src/tests/c
 | **15** | Simular reinício do serviço com trabalhos `processing` na fila | `recoverAndResumeQueue()` recupera os trabalhos do disco (`/app/data`) e conclui a aprendizagem. |
 | **16** | Confirmar que `/extract` e `/textshot` (incluindo excerto de 2.000 chars) continuam operacionais | Ambos os contratos e rotas funcionam sem qualquer regressão. |
 | **17** | Consultar `/train/summary` e `/train/history` com filtros e paginação estável por cursor | Retorna métricas reais (`accuracy`, `macroF1`, `weightedF1`), contagens por categoria e histórico distinguindo `new_example`, `idempotent_duplicate`, `label_correction`, `rejected` e `failed`. |
+| **18** | Cenário real de produção com 4 categorias elegíveis (Factura=20, Factura Adiantamento=16, Factura Global=12, Ficha de Intervenção=14 → 62 exemplos) | As 4 categorias são validadas e ativadas em conjunto; `sum(confusionMatrix) = 62`, somas das linhas = `support`, e `precision`/`recall`/`f1`/`accuracy`/`macroF1`/`weightedF1` recalculados a partir da matriz coincidem exatamente com os valores reportados. |
+| **19** | Categoria elegível com F1 insuficiente | Modelo ativo mantém-se (`v1.0.1`, sem inflação de versão); `trainingDiagnostics.rejectionReasons` e `categories[].activation` (`CATEGORY_F1_BELOW_THRESHOLD`, `candidateF1 < 0.75`) persistidos e recuperados após reinício. |
+| **20** | Arranque sobre estado persistido com categorias elegíveis não aprendidas / métricas legadas | `recoverAndResumeQueue()` dispara reavaliação automática, ativa todas as categorias elegíveis e marca os exemplos como `learned`, sem apagar dados. |
 
 ---
 

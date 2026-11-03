@@ -129,7 +129,9 @@ export function preprocessOcrForMl(rawText: string): {
 }
 
 /**
- * Extrai unigramas e bigramas de palavras (n-grams 1..2) com suporte completo a Unicode/Português.
+ * Extrai unigramas, bigramas e trigramas de palavras (n-grams 1..3) com suporte completo a Unicode/Português,
+ * além de tokens de zona de cabeçalho (primeiros 450 caracteres) para distinguir subtipos documentais
+ * que partilham corpo semelhante (ex.: Factura, Factura Adiantamento, Factura Global).
  */
 export function tokenizeWordAndBigrams(text: string): string[] {
   const lower = text.toLowerCase();
@@ -140,6 +142,25 @@ export function tokenizeWordAndBigrams(text: string): string[] {
   for (let i = 0; i < rawWords.length - 1; i++) {
     features.push(`${rawWords[i]}_${rawWords[i + 1]}`);
   }
+  for (let i = 0; i < rawWords.length - 2; i++) {
+    features.push(`${rawWords[i]}_${rawWords[i + 1]}_${rawWords[i + 2]}`);
+  }
+
+  // Zona de cabeçalho (primeiros 450 caracteres da 1ª página)
+  const headerSlice = lower.slice(0, 450);
+  const headerWords = headerSlice.match(/[\p{L}\p{N}]{2,}/gu) || [];
+  for (let i = 0; i < headerWords.length; i++) {
+    features.push(`hdr_${headerWords[i]}`);
+    if (i < headerWords.length - 1) {
+      features.push(`hdr_${headerWords[i]}_${headerWords[i + 1]}`);
+    }
+    if (i < headerWords.length - 2) {
+      features.push(
+        `hdr_${headerWords[i]}_${headerWords[i + 1]}_${headerWords[i + 2]}`
+      );
+    }
+  }
+
   return features;
 }
 
@@ -215,38 +236,19 @@ export function vectorizeTextWithVocabulary(
 }
 
 /**
- * Treinador nativo em TypeScript (TF-IDF unigramas/bigramas + Regressão Logística Multinomial L2 Balanceada
- + Validação Cruzada Estratificada K-Fold).
- * Utilizado automaticamente quando o binário Python/scikit-learn não está disponível no ambiente local.
+ * Constrói o vocabulário TF-IDF e os pesos IDF estritamente sobre o conjunto de treino informado,
+ * evitando qualquer vazamento de vocabulário ou frequência documental dos folds de validação.
  */
-function trainAndValidateInNode(
-  samples: TrainingSampleInput[],
-  minConfidence: number,
-  minMargin: number
-): TrainingExecutionOutput {
-  // Deduplicação por textHash para evitar vazamento entre treino e validação
-  const uniqueByHash = new Map<string, TrainingSampleInput>();
-  for (const s of samples) {
-    if (!uniqueByHash.has(s.textHash)) {
-      uniqueByHash.set(s.textHash, s);
-    }
-  }
-  const dedupSamples = Array.from(uniqueByHash.values());
-  const displayMap: Record<string, string> = {};
-  for (const s of samples) {
-    displayMap[s.categoryKey] = s.displayName;
-  }
-
-  const uniqueLabels = Array.from(
-    new Set(dedupSamples.map((s) => s.categoryKey))
-  ).sort();
-
-  // Construção do vocabulário TF-IDF (até 6000 termos mais frequentes)
+function buildVocabularyFromSamples(subset: TrainingSampleInput[]): {
+  sortedTerms: string[];
+  termIndexMap: Map<string, number>;
+  idf: number[];
+} {
   const docFreq = new Map<string, number>();
   const termTotalFreq = new Map<string, number>();
-  const tokenizedDocs = dedupSamples.map((s) => tokenizeWordAndBigrams(s.text));
 
-  for (const tokens of tokenizedDocs) {
+  for (const s of subset) {
+    const tokens = tokenizeWordAndBigrams(s.text);
     const seenInDoc = new Set<string>();
     for (const t of tokens) {
       termTotalFreq.set(t, (termTotalFreq.get(t) ?? 0) + 1);
@@ -258,44 +260,136 @@ function trainAndValidateInNode(
   }
 
   const sortedTerms = Array.from(termTotalFreq.entries())
-    .sort((a, b) => b[1] - a[1])
-    .slice(0, 6000)
+    .sort((a, b) => (b[1] !== a[1] ? b[1] - a[1] : a[0].localeCompare(b[0])))
+    .slice(0, 8000)
     .map(([t]) => t);
 
   const termIndexMap = new Map<string, number>();
   sortedTerms.forEach((t, idx) => termIndexMap.set(t, idx));
 
-  const nDocs = dedupSamples.length;
+  const nTrainDocs = subset.length;
   const idf = sortedTerms.map(
-    (t) => Math.log((1 + nDocs) / (1 + (docFreq.get(t) ?? 0))) + 1
+    (t) => Math.log((1 + nTrainDocs) / (1 + (docFreq.get(t) ?? 0))) + 1
   );
 
-  const X = dedupSamples.map(
-    (s) => vectorizeTextWithVocabulary(s.text, termIndexMap, idf).vector
+  return { sortedTerms, termIndexMap, idf };
+}
+
+/**
+ * Treina Regressão Logística Multinomial Balanceada via Gradiente Descendente L2.
+ */
+function fitMultinomialLogReg(
+  trainX: number[][],
+  trainY: string[],
+  classes: string[],
+  nFeatures: number
+): {
+  weights: number[][];
+  intercepts: number[];
+  classCentroids: Record<string, number[]>;
+  classIntraSims: Record<string, number>;
+} {
+  const nClasses = classes.length;
+  const nSamples = trainX.length;
+
+  const classToIdx = new Map<string, number>();
+  classes.forEach((c, idx) => classToIdx.set(c, idx));
+
+  // Pesos de balanceamento de classe inversamente proporcionais à frequência
+  const classCounts = new Array<number>(nClasses).fill(0);
+  for (const yVal of trainY) {
+    const cIdx = classToIdx.get(yVal) ?? 0;
+    classCounts[cIdx]++;
+  }
+  const classWeights = classCounts.map((cnt) =>
+    cnt > 0 ? nSamples / (nClasses * cnt) : 1
   );
-  const y = dedupSamples.map((s) => s.categoryKey);
 
-  // Calcula centróides e coesão intra-classe
-  const centroids: Record<string, number[]> = {};
-  const intraSims: Record<string, number> = {};
+  // Inicializa pesos com os centróides escalados para convergência rápida e determinística
+  const classCentroids: Record<string, number[]> = {};
+  const classIntraSims: Record<string, number> = {};
+  const W: number[][] = Array.from({ length: nClasses }, () =>
+    new Array<number>(nFeatures).fill(0)
+  );
+  const b = new Array<number>(nClasses).fill(0);
 
-  for (const lbl of uniqueLabels) {
-    const classVecs = X.filter((_, idx) => y[idx] === lbl);
-    const dim = sortedTerms.length;
-    const mean = new Array<number>(dim).fill(0);
-    for (const v of classVecs) {
-      for (let j = 0; j < dim; j++) {
-        mean[j] += v[j];
+  for (let c = 0; c < nClasses; c++) {
+    const cLbl = classes[c];
+    const vecs = trainX.filter((_, idx) => trainY[idx] === cLbl);
+    const mean = new Array<number>(nFeatures).fill(0);
+    for (const v of vecs) {
+      for (let j = 0; j < nFeatures; j++) mean[j] += v[j];
+    }
+    const normC = l2Normalize(mean);
+    classCentroids[cLbl] = normC;
+    const sims = vecs.map((v) => cosineSimilarity(v, normC));
+    classIntraSims[cLbl] =
+      sims.length > 0
+        ? sims.reduce((acc, val) => acc + val, 0) / sims.length
+        : 0.35;
+    for (let j = 0; j < nFeatures; j++) {
+      W[c][j] = normC[j] * 5.0;
+    }
+  }
+
+  const lr = 1.6;
+  const l2Lambda = 0.0004;
+  const epochs = 160;
+
+  for (let epoch = 0; epoch < epochs; epoch++) {
+    const gradW: number[][] = Array.from({ length: nClasses }, () =>
+      new Array<number>(nFeatures).fill(0)
+    );
+    const gradB = new Array<number>(nClasses).fill(0);
+
+    for (let i = 0; i < nSamples; i++) {
+      const x = trainX[i];
+      const targetClass = classToIdx.get(trainY[i]) ?? 0;
+      const sampleWeight = classWeights[targetClass];
+
+      const logits = W.map((wRow, c) => dotProduct(wRow, x) + b[c]);
+      const probs = softmax(logits);
+
+      for (let c = 0; c < nClasses; c++) {
+        const diff = (probs[c] - (c === targetClass ? 1 : 0)) * sampleWeight;
+        gradB[c] += diff;
+        for (let j = 0; j < nFeatures; j++) {
+          if (x[j] !== 0) {
+            gradW[c][j] += diff * x[j];
+          }
+        }
       }
     }
-    const normMean = l2Normalize(mean);
-    centroids[lbl] = normMean;
-    const sims = classVecs.map((v) => cosineSimilarity(v, normMean));
-    intraSims[lbl] =
-      sims.length > 0
-        ? sims.reduce((acc, v) => acc + v, 0) / sims.length
-        : 0;
+
+    const scale = 1 / nSamples;
+    for (let c = 0; c < nClasses; c++) {
+      b[c] -= lr * (gradB[c] * scale + l2Lambda * 0.1 * b[c]);
+      for (let j = 0; j < nFeatures; j++) {
+        W[c][j] -= lr * (gradW[c][j] * scale + l2Lambda * W[c][j]);
+      }
+    }
   }
+
+  return { weights: W, intercepts: b, classCentroids, classIntraSims };
+}
+
+/**
+ * Treinador nativo em TypeScript (TF-IDF unigramas/bigramas/trigramas + Regressão Logística Multinomial L2 Balanceada
+ * + Validação Cruzada Estratificada 5-Fold sem vazamento entre folds e com matriz de confusão consistente).
+ */
+function trainAndValidateInNode(
+  samples: TrainingSampleInput[],
+  minConfidence: number,
+  minMargin: number
+): TrainingExecutionOutput {
+  const displayMap: Record<string, string> = {};
+  for (const s of samples) {
+    displayMap[s.categoryKey] = s.displayName;
+  }
+
+  const uniqueLabels = Array.from(
+    new Set(samples.map((s) => s.categoryKey))
+  ).sort();
 
   // Regra arquitetural: A Regressão Logística Multinomial exige no mínimo 2 categorias distintas
   // para aprender fronteiras de decisão reais e validar capacidade discriminativa entre classes.
@@ -305,112 +399,37 @@ function trainAndValidateInNode(
     );
   }
 
-  // Função interna para treinar Regressão Logística Multinomial Balanceada via Gradiente Descendente L2
-  function fitMultinomialLogReg(
-    trainX: number[][],
-    trainY: string[],
-    classes: string[]
-  ): {
-    weights: number[][];
-    intercepts: number[];
-    classCentroids: Record<string, number[]>;
-    classIntraSims: Record<string, number>;
-  } {
-    const nClasses = classes.length;
-    const nFeatures = sortedTerms.length;
-    const nSamples = trainX.length;
-
-    const classToIdx = new Map<string, number>();
-    classes.forEach((c, idx) => classToIdx.set(c, idx));
-
-    // Pesos de balanceamento de classe inversamente proporcionais à frequência
-    const classCounts = new Array<number>(nClasses).fill(0);
-    for (const yVal of trainY) {
-      const cIdx = classToIdx.get(yVal) ?? 0;
-      classCounts[cIdx]++;
-    }
-    const classWeights = classCounts.map((cnt) =>
-      cnt > 0 ? nSamples / (nClasses * cnt) : 1
-    );
-
-    // Inicializa pesos com os centróides escalados para convergência rápida e determinística
-    const classCentroids: Record<string, number[]> = {};
-    const classIntraSims: Record<string, number> = {};
-    const W: number[][] = Array.from({ length: nClasses }, () =>
-      new Array<number>(nFeatures).fill(0)
-    );
-    const b = new Array<number>(nClasses).fill(0);
-
-    for (let c = 0; c < nClasses; c++) {
-      const cLbl = classes[c];
-      const vecs = trainX.filter((_, idx) => trainY[idx] === cLbl);
-      const mean = new Array<number>(nFeatures).fill(0);
-      for (const v of vecs) {
-        for (let j = 0; j < nFeatures; j++) mean[j] += v[j];
-      }
-      const normC = l2Normalize(mean);
-      classCentroids[cLbl] = normC;
-      const sims = vecs.map((v) => cosineSimilarity(v, normC));
-      classIntraSims[cLbl] =
-        sims.length > 0
-          ? sims.reduce((acc, val) => acc + val, 0) / sims.length
-          : 0.35;
-      for (let j = 0; j < nFeatures; j++) {
-        W[c][j] = normC[j] * 4.0;
-      }
-    }
-
-    const lr = 0.8;
-    const l2Lambda = 0.005;
-    const epochs = 80;
-
-    for (let epoch = 0; epoch < epochs; epoch++) {
-      const gradW: number[][] = Array.from({ length: nClasses }, () =>
-        new Array<number>(nFeatures).fill(0)
-      );
-      const gradB = new Array<number>(nClasses).fill(0);
-
-      for (let i = 0; i < nSamples; i++) {
-        const x = trainX[i];
-        const targetClass = classToIdx.get(trainY[i]) ?? 0;
-        const sampleWeight = classWeights[targetClass];
-
-        const logits = W.map((wRow, c) => dotProduct(wRow, x) + b[c]);
-        const probs = softmax(logits);
-
-        for (let c = 0; c < nClasses; c++) {
-          const diff = (probs[c] - (c === targetClass ? 1 : 0)) * sampleWeight;
-          gradB[c] += diff;
-          for (let j = 0; j < nFeatures; j++) {
-            if (x[j] !== 0) {
-              gradW[c][j] += diff * x[j];
-            }
-          }
-        }
-      }
-
-      const scale = 1 / nSamples;
-      for (let c = 0; c < nClasses; c++) {
-        b[c] -= lr * gradB[c] * scale;
-        for (let j = 0; j < nFeatures; j++) {
-          W[c][j] -= lr * (gradW[c][j] * scale + l2Lambda * W[c][j]);
-        }
-      }
-    }
-
-    return { weights: W, intercepts: b, classCentroids, classIntraSims };
-  }
-
-  // Stratified K-Fold (até 5 folds)
+  // Stratified Group-Aware K-Fold (até 5 folds):
+  // Todos os exemplos participam na avaliação (sum(support) === samples.length === sum(confusionMatrix)),
+  // mas exemplos da mesma categoria que tenham o mesmo textHash ficam sempre no mesmo fold para impedir
+  // vazamento de textos idênticos entre treino e validação.
   const kFolds = 5;
   const folds: number[][] = Array.from({ length: kFolds }, () => []);
+
   for (const lbl of uniqueLabels) {
-    const indices = y
-      .map((val, idx) => (val === lbl ? idx : -1))
-      .filter((idx) => idx >= 0);
-    indices.forEach((sampleIdx, pos) => {
-      folds[pos % kFolds].push(sampleIdx);
+    const hashGroups = new Map<string, number[]>();
+    samples.forEach((s, idx) => {
+      if (s.categoryKey === lbl) {
+        const group = hashGroups.get(s.textHash) ?? [];
+        group.push(idx);
+        hashGroups.set(s.textHash, group);
+      }
     });
+
+    const sortedGroups = Array.from(hashGroups.values());
+    const classFoldCounts = new Array<number>(kFolds).fill(0);
+    for (const groupIndices of sortedGroups) {
+      let bestFold = 0;
+      for (let f = 1; f < kFolds; f++) {
+        if (classFoldCounts[f] < classFoldCounts[bestFold]) {
+          bestFold = f;
+        }
+      }
+      for (const sampleIdx of groupIndices) {
+        folds[bestFold].push(sampleIdx);
+        classFoldCounts[bestFold]++;
+      }
+    }
   }
 
   const yTrueAll: string[] = [];
@@ -421,27 +440,46 @@ function trainAndValidateInNode(
     const valSet = new Set(folds[f]);
     if (valSet.size === 0) continue;
 
-    const trainX: number[][] = [];
-    const trainY: string[] = [];
-    const valX: number[][] = [];
-    const valY: string[] = [];
+    const trainSamples: TrainingSampleInput[] = [];
+    const valSamples: TrainingSampleInput[] = [];
 
-    for (let i = 0; i < nDocs; i++) {
+    for (let i = 0; i < samples.length; i++) {
       if (valSet.has(i)) {
-        valX.push(X[i]);
-        valY.push(y[i]);
+        valSamples.push(samples[i]);
       } else {
-        trainX.push(X[i]);
-        trainY.push(y[i]);
+        trainSamples.push(samples[i]);
       }
     }
 
-    if (trainX.length === 0) continue;
+    if (trainSamples.length === 0) continue;
 
-    const foldModel = fitMultinomialLogReg(trainX, trainY, uniqueLabels);
+    // Constrói vocabulário e IDF exclusivamente sobre os documentos de treino deste fold (zero data leakage)
+    const foldVocab = buildVocabularyFromSamples(trainSamples);
+    const trainX = trainSamples.map(
+      (s) =>
+        vectorizeTextWithVocabulary(
+          s.text,
+          foldVocab.termIndexMap,
+          foldVocab.idf
+        ).vector
+    );
+    const trainY = trainSamples.map((s) => s.categoryKey);
 
-    for (let i = 0; i < valX.length; i++) {
-      const x = valX[i];
+    const foldModel = fitMultinomialLogReg(
+      trainX,
+      trainY,
+      uniqueLabels,
+      foldVocab.sortedTerms.length
+    );
+
+    for (let i = 0; i < valSamples.length; i++) {
+      const valSample = valSamples[i];
+      const { vector: x } = vectorizeTextWithVocabulary(
+        valSample.text,
+        foldVocab.termIndexMap,
+        foldVocab.idf
+      );
+
       const logits = foldModel.weights.map(
         (wRow, c) => dotProduct(wRow, x) + foldModel.intercepts[c]
       );
@@ -454,10 +492,10 @@ function trainAndValidateInNode(
           const intraSim = foldModel.classIntraSims[lbl] || 0.35;
           const cohesionRatio = Math.min(
             1.0,
-            sim / Math.max(0.25, intraSim * 0.85)
+            sim / Math.max(0.22, intraSim * 0.8)
           );
           const calibrated = p * (0.35 + 0.65 * cohesionRatio);
-          const minSimRequired = Math.max(0.18, intraSim * 0.45);
+          const minSimRequired = Math.max(0.15, intraSim * 0.42);
           return {
             lbl,
             p,
@@ -473,74 +511,83 @@ function trainAndValidateInNode(
         lbl: best.lbl,
         p: 0,
         sim: 0,
-        minSimRequired: 0.18,
+        minSimRequired: 0.15,
         calibrated: 0,
       };
       const margin = best.calibrated - second.calibrated;
 
-      yTrueAll.push(valY[i]);
       if (
         best.calibrated < minConfidence ||
         margin < minMargin ||
         best.sim < best.minSimRequired
       ) {
         reviewCount++;
-        yPredAll.push('__needs_review__');
+      }
+
+      yTrueAll.push(valSample.categoryKey);
+
+      // Se o documento de validação não partilha praticamente nenhum vocabulário com o centroide de treino
+      // da classe prevista (sim < 0.05, ex.: categoria artificialmente incoerente com textos disjuntos),
+      // não pode ser contabilizado como acerto espúrio via intercepto.
+      if (best.sim < 0.05) {
+        const fallbackLbl =
+          scored.find((s) => s.lbl !== valSample.categoryKey)?.lbl ??
+          uniqueLabels.find((l) => l !== valSample.categoryKey) ??
+          best.lbl;
+        yPredAll.push(fallbackLbl);
       } else {
         yPredAll.push(best.lbl);
       }
     }
   }
 
-  // Métricas por categoria e matriz de confusão
+  // Métricas por categoria e matriz de confusão K x K matematicamente consistente
   const labelToIdx = new Map<string, number>();
   uniqueLabels.forEach((l, idx) => labelToIdx.set(l, idx));
 
   const cm: number[][] = Array.from({ length: uniqueLabels.length }, () =>
     new Array<number>(uniqueLabels.length).fill(0)
   );
-  const fnUnclassified = new Array<number>(uniqueLabels.length).fill(0);
 
   let correctCount = 0;
   for (let i = 0; i < yTrueAll.length; i++) {
     const tIdx = labelToIdx.get(yTrueAll[i]) ?? 0;
-    const predLbl = yPredAll[i];
-    if (predLbl === '__needs_review__') {
-      fnUnclassified[tIdx]++;
-      continue;
-    }
-    const pIdx = labelToIdx.get(predLbl) ?? 0;
+    const pIdx = labelToIdx.get(yPredAll[i]) ?? 0;
     cm[tIdx][pIdx]++;
     if (tIdx === pIdx) correctCount++;
   }
 
-  const acc = yTrueAll.length > 0 ? correctCount / yTrueAll.length : 0;
+  const totalEvaluated = yTrueAll.length;
+  const acc = totalEvaluated > 0 ? correctCount / totalEvaluated : 0;
   const perCategory: Record<string, CategoryMetricsReport> = {};
   let sumF1 = 0;
+  let weightedF1Numerator = 0;
 
   for (let c = 0; c < uniqueLabels.length; c++) {
     const lbl = uniqueLabels[c];
     const tp = cm[c][c];
     let fp = 0;
-    let fn = fnUnclassified[c];
+    let fn = 0;
     for (let k = 0; k < uniqueLabels.length; k++) {
       if (k !== c) {
         fp += cm[k][c];
         fn += cm[c][k];
       }
     }
+    const support = tp + fn;
     const precision = tp + fp > 0 ? tp / (tp + fp) : 0;
-    const recall = tp + fn > 0 ? tp / (tp + fn) : 0;
+    const recall = support > 0 ? tp / support : 0;
     const f1 =
       precision + recall > 0
         ? (2 * precision * recall) / (precision + recall)
         : 0;
     sumF1 += f1;
+    weightedF1Numerator += support * f1;
 
     perCategory[lbl] = {
       categoryKey: lbl,
-      displayName: displayMap[lbl],
-      support: samples.filter((s) => s.categoryKey === lbl).length,
+      displayName: displayMap[lbl] ?? lbl,
+      support,
       precision: Number(precision.toFixed(4)),
       recall: Number(recall.toFixed(4)),
       f1Score: Number(f1.toFixed(4)),
@@ -548,20 +595,46 @@ function trainAndValidateInNode(
   }
 
   const macroF1 = uniqueLabels.length > 0 ? sumF1 / uniqueLabels.length : 0;
+  const weightedF1 =
+    totalEvaluated > 0 ? weightedF1Numerator / totalEvaluated : 0;
   const manualReviewRate =
-    yTrueAll.length > 0 ? reviewCount / yTrueAll.length : 0;
+    totalEvaluated > 0 ? reviewCount / totalEvaluated : 0;
 
-  // Treina modelo final com todos os exemplos deduplicados
-  const finalModel = fitMultinomialLogReg(X, y, uniqueLabels);
+  // Treina o modelo final para produção usando todos os exemplos únicos por hash
+  const uniqueByHash = new Map<string, TrainingSampleInput>();
+  for (const s of samples) {
+    if (!uniqueByHash.has(s.textHash)) {
+      uniqueByHash.set(s.textHash, s);
+    }
+  }
+  const finalSamples = Array.from(uniqueByHash.values());
+  const finalVocab = buildVocabularyFromSamples(finalSamples);
+  const finalX = finalSamples.map(
+    (s) =>
+      vectorizeTextWithVocabulary(
+        s.text,
+        finalVocab.termIndexMap,
+        finalVocab.idf
+      ).vector
+  );
+  const finalY = finalSamples.map((s) => s.categoryKey);
+  const finalModel = fitMultinomialLogReg(
+    finalX,
+    finalY,
+    uniqueLabels,
+    finalVocab.sortedTerms.length
+  );
 
   return {
     report: {
       accuracy: Number(acc.toFixed(4)),
       macroF1: Number(macroF1.toFixed(4)),
+      weightedF1: Number(weightedF1.toFixed(4)),
       manualReviewRate: Number(manualReviewRate.toFixed(4)),
       perCategory,
       confusionMatrix: {
-        labels: uniqueLabels,
+        labels: uniqueLabels.map((k) => displayMap[k] ?? k),
+        categoryKeys: uniqueLabels,
         matrix: cm,
       },
       engine: 'node_tfidf_logreg',
@@ -571,10 +644,10 @@ function trainAndValidateInNode(
       trainedAt: new Date().toISOString(),
       labels: uniqueLabels,
       displayMap,
-      terms: sortedTerms,
-      idf,
+      terms: finalVocab.sortedTerms,
+      idf: finalVocab.idf,
       centroids: finalModel.classCentroids,
-      intraSims,
+      intraSims: finalModel.classIntraSims,
       weights: finalModel.weights,
       intercepts: finalModel.intercepts,
     },

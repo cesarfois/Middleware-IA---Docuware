@@ -10,6 +10,7 @@ import {
   validateAndNormalizeTrainRequest,
 } from '../classifier-service.js';
 import { ClassifierStore } from '../classifier-store.js';
+import { preprocessOcrForMl } from '../ml-engine.js';
 import {
   DocuWarePlatformClient,
   DocuWareServiceError,
@@ -90,8 +91,10 @@ function buildRealisticOcrText(kind: string, docId: number): string {
         'medicina cardiologia estetoscopio diagnostico bisturi clinica cirurgiao anatomia',
         'nautica navio bussola ancora proa popa estibordo bombordo marinheiro',
       ];
+      // Nota: não acrescentar sufixos comuns (ex.: "exclusivo_X topico_X"), pois a normalização OCR remove "_"
+      // e geraria tokens partilhados por todos os exemplos, tornando a categoria artificialmente coerente.
       const bucket = vocabBuckets[docId % vocabBuckets.length];
-      return `${bucket} exclusivo_${docId} topico_${docId}`;
+      return `${bucket} ${bucket}`;
     }
 
     case 'ambiguo':
@@ -729,6 +732,8 @@ describe('Sistema de Aprendizagem Supervisionada e Classificação Automática L
     assert.equal(guiaCat.pendingExamples, 2);
     assert.equal(guiaCat.active, false);
     assert.equal(guiaCat.validation, null);
+    assert.equal(guiaCat.activation.eligible, false);
+    assert.equal(guiaCat.activation.reasonCode, 'INSUFFICIENT_EXAMPLES');
     assert.ok(guiaCat.lastExampleAt);
 
     const fichaCat = summaryRes.categories.find(
@@ -741,6 +746,11 @@ describe('Sistema de Aprendizagem Supervisionada e Classificação Automática L
     assert.equal(fichaCat.pendingExamples, 0);
     assert.ok(fichaCat.validation);
     assert.ok(fichaCat.validation.f1 >= 0.75);
+    assert.equal(fichaCat.activation.eligible, true);
+    assert.equal(fichaCat.activation.lastAttemptStatus, 'approved');
+    assert.equal(fichaCat.activation.reasonCode, 'VALIDATED_AND_ACTIVE');
+    assert.ok(summaryRes.trainingDiagnostics.lastAttemptAt);
+    assert.equal(summaryRes.trainingDiagnostics.activationApproved, true);
 
     // Consulta o histórico (/train/history) com paginação por cursor
     const page1 = service.getTrainingHistory({ limit: 5 });
@@ -811,5 +821,349 @@ describe('Sistema de Aprendizagem Supervisionada e Classificação Automática L
       documentType: 'Guia de Remessa',
     });
     assert.equal(guiaHistory.totalMatching, 4);
+  });
+
+  it('Cenário 18: Deve validar e ativar todas as 4 categorias do cenário real de produção (62 exemplos: Factura=20, Factura Adiantamento=16, Factura Global=12, Ficha de Intervenção=14) com consistência matemática exata na matriz de confusão', async () => {
+    const prodDir = fs.mkdtempSync(
+      path.join(os.tmpdir(), 'dw-classifier-prod62-')
+    );
+    try {
+      const prodStore = new ClassifierStore(prodDir);
+      const prodService = new ClassifierService(prodStore, mockDwClient);
+      const cab = 'fc-prod-62';
+
+      // 1. Factura (20 exemplos) - partilha rodapé fiscal comum com as outras faturas
+      for (let i = 1; i <= 20; i++) {
+        const docId = 10000 + i;
+        mockDocuments.set(
+          `${cab}:${docId}`,
+          `FACTURA COMERCIAL Nº FT 2026/${docId}\nData de Emissão: 2026-10-${(i % 28) + 1}\nCliente: Sociedade Mineira de Catoca Lda - NIF 540112233${i}\n Artigo: Fornecimento de licenças de software e manutenção mensal ref ${i}.\nSubtotal líquido: ${i * 1500},00 Kz | IVA 14%: ${i * 210},00 Kz | Total a Pagar: ${i * 1710},00 Kz.\nProcessado por programa validado n.º 144/AGT/2024. Coordenadas Bancárias IBAN AO06.0040.0000.`
+        );
+        prodService.enqueueTrainingDocument(
+          validateAndNormalizeTrainRequest({
+            fileCabinetId: cab,
+            documentId: docId,
+            documentType: 'Factura',
+          })
+        );
+      }
+
+      // 2. Ficha de Intervenção (14 exemplos)
+      for (let i = 1; i <= 14; i++) {
+        const docId = 20000 + i;
+        mockDocuments.set(
+          `${cab}:${docId}`,
+          `FICHA DE INTERVENÇÃO TÉCNICA Nº FIT-2026-${docId}\nTécnico Responsável: Eng. Mateus Silva | Equipamento: Servidor Bastidor #${i}\nDiagnóstico e trabalhos executados: Substituição de fonte de alimentação redundante, atualização de firmware e testes de carga concluídos sem anomalias.\nTempo de intervenção: ${i + 1} horas. Assinatura do cliente e carimbo de conformidade técnica.`
+        );
+        prodService.enqueueTrainingDocument(
+          validateAndNormalizeTrainRequest({
+            fileCabinetId: cab,
+            documentId: docId,
+            documentType: 'Ficha de Intervenção',
+          })
+        );
+      }
+
+      // 3. Factura Adiantamento (16 exemplos) - partilha vocabulário fiscal de fatura, mas com cabeçalho/termos de adiantamento
+      for (let i = 1; i <= 16; i++) {
+        const docId = 30000 + i;
+        mockDocuments.set(
+          `${cab}:${docId}`,
+          `FACTURA ADIANTAMENTO Nº FA 2026/${docId}\nDocumento de Adiantamento / Sinal Antecipado (${30 + (i % 3) * 10}% do valor contratual)\nCliente: Sociedade Mineira de Catoca Lda - NIF 540112233${i}\nDescrição: Pagamento antecipado de caução inicial para adjudicação do projeto fase ${i}.\nSubtotal líquido: ${i * 2000},00 Kz | IVA 14%: ${i * 280},00 Kz | Total de Adiantamento: ${i * 2280},00 Kz.\nProcessado por programa validado n.º 144/AGT/2024. Coordenadas Bancárias IBAN AO06.0040.0000.`
+        );
+        prodService.enqueueTrainingDocument(
+          validateAndNormalizeTrainRequest({
+            fileCabinetId: cab,
+            documentId: docId,
+            documentType: 'Factura Adiantamento',
+          })
+        );
+      }
+
+      // 4. Factura Global (12 exemplos) - partilha vocabulário fiscal de fatura, mas com resumo global mensal de guias
+      for (let i = 1; i <= 12; i++) {
+        const docId = 40000 + i;
+        mockDocuments.set(
+          `${cab}:${docId}`,
+          `FACTURA GLOBAL MENSAL Nº FG 2026/${docId}\nResumo Consolidado de Faturação Global do Período Mensal ${i}/2026\nCliente: Sociedade Mineira de Catoca Lda - NIF 540112233${i}\nAgrupamento consolidado das guias de remessa e consumos acumulados do mês n.º GR-${i}01 a GR-${i}25.\nSubtotal líquido: ${i * 9500},00 Kz | IVA 14%: ${i * 1330},00 Kz | Total Global Consolidado: ${i * 10830},00 Kz.\nProcessado por programa validado n.º 144/AGT/2024. Coordenadas Bancárias IBAN AO06.0040.0000.`
+        );
+        prodService.enqueueTrainingDocument(
+          validateAndNormalizeTrainRequest({
+            fileCabinetId: cab,
+            documentId: docId,
+            documentType: 'Factura Global',
+          })
+        );
+      }
+
+      await prodService.waitForIdle();
+
+      const summary = prodService.getTrainingSummary();
+      assert.equal(summary.model.status, 'active');
+      assert.equal(summary.summary.totalCategories, 4);
+      assert.equal(summary.summary.eligibleCategories, 4);
+      assert.equal(summary.summary.activeCategories, 4);
+      assert.equal(summary.summary.pendingCategories, 0);
+      assert.equal(summary.summary.totalExamples, 62);
+      assert.equal(summary.summary.learnedExamples, 62);
+      assert.equal(summary.summary.pendingExamples, 0);
+
+      // Verificação de consistência matemática estrita entre a Matriz de Confusão 4x4 e as métricas reportadas
+      const diag = summary.trainingDiagnostics;
+      assert.equal(diag.activationApproved, true);
+      assert.equal(diag.candidateExamples, 62);
+      assert.equal(diag.candidateCategories.length, 4);
+      assert.equal(diag.rejectionReasons.length, 0);
+      assert.ok(diag.candidateValidation);
+
+      const cm = diag.candidateValidation.confusionMatrix;
+      assert.equal(cm.labels.length, 4);
+      assert.equal(cm.matrix.length, 4);
+
+      const totalCmSum = cm.matrix.reduce(
+        (acc, row) => acc + row.reduce((rAcc, v) => rAcc + v, 0),
+        0
+      );
+      assert.equal(totalCmSum, 62);
+
+      let diagSum = 0;
+      let macroF1Sum = 0;
+      let weightedF1Sum = 0;
+
+      for (let c = 0; c < 4; c++) {
+        const label = cm.labels[c]!;
+        const catMetrics = diag.candidateValidation.perCategory[label];
+        assert.ok(catMetrics, `Métricas ausentes para ${label}`);
+
+        const tp = cm.matrix[c]![c]!;
+        const rowSum = cm.matrix[c]!.reduce((a, b) => a + b, 0);
+        let colSum = 0;
+        for (let r = 0; r < 4; r++) {
+          colSum += cm.matrix[r]![c]!;
+        }
+
+        const expectedPrecision = colSum > 0 ? Number((tp / colSum).toFixed(4)) : 0;
+        const expectedRecall = rowSum > 0 ? Number((tp / rowSum).toFixed(4)) : 0;
+        const rawP = colSum > 0 ? tp / colSum : 0;
+        const rawR = rowSum > 0 ? tp / rowSum : 0;
+        const expectedF1 =
+          rawP + rawR > 0
+            ? Number(((2 * rawP * rawR) / (rawP + rawR)).toFixed(4))
+            : 0;
+
+        assert.equal(catMetrics.support, rowSum);
+        assert.equal(catMetrics.precision, expectedPrecision);
+        assert.equal(catMetrics.recall, expectedRecall);
+        assert.equal(catMetrics.f1, expectedF1);
+        assert.ok(catMetrics.f1 >= 0.75);
+
+        diagSum += tp;
+        macroF1Sum += expectedF1;
+        weightedF1Sum += expectedF1 * rowSum;
+      }
+
+      const expectedAccuracy = Number((diagSum / 62).toFixed(4));
+      const expectedMacroF1 = Number((macroF1Sum / 4).toFixed(4));
+      const expectedWeightedF1 = Number((weightedF1Sum / 62).toFixed(4));
+
+      assert.equal(diag.candidateValidation.accuracy, expectedAccuracy);
+      assert.equal(diag.candidateValidation.macroF1, expectedMacroF1);
+      assert.equal(diag.candidateValidation.weightedF1, expectedWeightedF1);
+      assert.equal(summary.model.validation?.accuracy, expectedAccuracy);
+      assert.equal(summary.model.validation?.macroF1, expectedMacroF1);
+      assert.equal(summary.model.validation?.weightedF1, expectedWeightedF1);
+
+      for (const catItem of summary.categories) {
+        assert.equal(catItem.status, 'active');
+        assert.equal(catItem.active, true);
+        assert.equal(
+          catItem.examplesIncludedInModel,
+          catItem.examplesReceived
+        );
+        assert.equal(catItem.pendingExamples, 0);
+        assert.equal(catItem.activation.eligible, true);
+        assert.equal(catItem.activation.includedInLastCandidate, true);
+        assert.equal(catItem.activation.lastAttemptStatus, 'approved');
+        assert.equal(catItem.activation.reasonCode, 'VALIDATED_AND_ACTIVE');
+      }
+    } finally {
+      fs.rmSync(prodDir, { recursive: true, force: true });
+    }
+  });
+
+  it('Cenário 19: Deve registar e persistir diagnóstico detalhado quando uma categoria elegível reprova por F1 insuficiente e recuperar em reinício quando corrigida', async () => {
+    const diagDir = fs.mkdtempSync(
+      path.join(os.tmpdir(), 'dw-classifier-diag-')
+    );
+    try {
+      const diagStore = new ClassifierStore(diagDir);
+      const diagService = new ClassifierService(diagStore, mockDwClient);
+      const cab = 'fc-diag-01';
+
+      // 10 exemplos de Factura e 10 de Ficha de Intervenção -> modelo ativo v1.0.1
+      for (let i = 1; i <= 10; i++) {
+        mockDocuments.set(
+          `${cab}:${50000 + i}`,
+          `FACTURA COMERCIAL Nº FT-${i} emitida ao cliente com IVA 14%, subtotal líquido e IBAN bancário para pagamento.`
+        );
+        diagService.enqueueTrainingDocument(
+          validateAndNormalizeTrainRequest({
+            fileCabinetId: cab,
+            documentId: 50000 + i,
+            documentType: 'Factura',
+          })
+        );
+
+        mockDocuments.set(
+          `${cab}:${60000 + i}`,
+          `FICHA DE INTERVENÇÃO TÉCNICA Nº FIT-${i} com relatório de manutenção preventiva de servidor, diagnóstico e assinatura do técnico.`
+        );
+        diagService.enqueueTrainingDocument(
+          validateAndNormalizeTrainRequest({
+            fileCabinetId: cab,
+            documentId: 60000 + i,
+            documentType: 'Ficha de Intervenção',
+          })
+        );
+      }
+
+      await diagService.waitForIdle();
+      assert.equal(diagService.getTrainingSummary().model.version, 'v1.0.1');
+
+      // Adiciona 10 exemplos contraditórios/ruído para "Categoria Incoerente" (copiando textos de Factura e Ficha de Intervenção)
+      for (let i = 1; i <= 10; i++) {
+        const docId = 70000 + i;
+        const noisyText =
+          i % 2 === 0
+            ? `FACTURA COMERCIAL Nº FT-${i} emitida ao cliente com IVA 14%, subtotal líquido e IBAN bancário para pagamento.`
+            : `FICHA DE INTERVENÇÃO TÉCNICA Nº FIT-${i} com relatório de manutenção preventiva de servidor, diagnóstico e assinatura do técnico.`;
+        mockDocuments.set(`${cab}:${docId}`, noisyText);
+        diagService.enqueueTrainingDocument(
+          validateAndNormalizeTrainRequest({
+            fileCabinetId: cab,
+            documentId: docId,
+            documentType: 'Categoria Incoerente',
+          })
+        );
+      }
+
+      await diagService.waitForIdle();
+
+      // Verifica diagnóstico persistido após rejeição da 3ª categoria
+      const reloadedStore = new ClassifierStore(diagDir);
+      const reloadedService = new ClassifierService(reloadedStore, mockDwClient);
+      const summaryAfterReject = reloadedService.getTrainingSummary();
+
+      assert.equal(summaryAfterReject.model.version, 'v1.0.1');
+      assert.equal(summaryAfterReject.summary.activeCategories, 2);
+      assert.equal(summaryAfterReject.summary.pendingCategories, 1);
+      assert.equal(
+        summaryAfterReject.trainingDiagnostics.activationApproved,
+        false
+      );
+      assert.ok(
+        summaryAfterReject.trainingDiagnostics.rejectionReasons.length >= 1
+      );
+      assert.equal(
+        summaryAfterReject.trainingDiagnostics.activeModelVersionBeforeAttempt,
+        'v1.0.1'
+      );
+      assert.equal(
+        summaryAfterReject.trainingDiagnostics.activeModelVersionAfterAttempt,
+        'v1.0.1'
+      );
+
+      const badCat = summaryAfterReject.categories.find(
+        (c) => c.documentType === 'Categoria Incoerente'
+      );
+      assert.ok(badCat);
+      assert.equal(badCat.status, 'pending_validation');
+      assert.equal(badCat.activation.eligible, true);
+      assert.equal(badCat.activation.includedInLastCandidate, true);
+      assert.equal(badCat.activation.lastAttemptStatus, 'rejected');
+      assert.equal(
+        badCat.activation.reasonCode,
+        'CATEGORY_F1_BELOW_THRESHOLD'
+      );
+      assert.ok(badCat.activation.candidateF1 !== null);
+      assert.ok(badCat.activation.candidateF1! < 0.75);
+      assert.equal(badCat.activation.requiredF1, 0.75);
+    } finally {
+      fs.rmSync(diagDir, { recursive: true, force: true });
+    }
+  });
+
+  it('Cenário 20: Deve reavaliar automaticamente no arranque (recoverAndResumeQueue) um estado legado com categorias elegíveis pendentes e métricas antigas sem perder os exemplos', async () => {
+    const healDir = fs.mkdtempSync(
+      path.join(os.tmpdir(), 'dw-classifier-heal-')
+    );
+    try {
+      const store1 = new ClassifierStore(healDir);
+      const cab = 'fc-heal-01';
+
+      // Popula diretamente no store 2 categorias ativas e 1 categoria elegível stored simulando estado legado em disco
+      for (let i = 1; i <= 10; i++) {
+        const t1 = preprocessOcrForMl(
+          `FACTURA COMERCIAL Nº FT-2026-${i} com valor líquido, IVA 14% e IBAN para liquidação financeira.`
+        );
+        store1.upsertExample({
+          fileCabinetId: cab,
+          documentId: 81000 + i,
+          categoryKey: 'factura',
+          displayName: 'Factura',
+          normalizedText: t1.normalizedText,
+          textHash: t1.textHash,
+          charCount: t1.normalizedText.length,
+          pageCount: 1,
+          trainingId: `trn-h1-${i}`,
+        });
+
+        const t2 = preprocessOcrForMl(
+          `FICHA DE INTERVENÇÃO TÉCNICA Nº FIT-2026-${i} referente a reparação de servidor, diagnóstico e substituição de peças.`
+        );
+        store1.upsertExample({
+          fileCabinetId: cab,
+          documentId: 82000 + i,
+          categoryKey: 'ficha_de_intervencao',
+          displayName: 'Ficha de Intervenção',
+          normalizedText: t2.normalizedText,
+          textHash: t2.textHash,
+          charCount: t2.normalizedText.length,
+          pageCount: 1,
+          trainingId: `trn-h2-${i}`,
+        });
+
+        const t3 = preprocessOcrForMl(
+          `FACTURA GLOBAL MENSAL Nº FG-2026-${i} consolidando as guias de remessa do período mensal e resumo de faturação.`
+        );
+        store1.upsertExample({
+          fileCabinetId: cab,
+          documentId: 83000 + i,
+          categoryKey: 'factura_global',
+          displayName: 'Factura Global',
+          normalizedText: t3.normalizedText,
+          textHash: t3.textHash,
+          charCount: t3.normalizedText.length,
+          pageCount: 1,
+          trainingId: `trn-h3-${i}`,
+        });
+      }
+
+      // Simula arranque do serviço sobre o diretório persistido
+      const bootedStore = new ClassifierStore(healDir);
+      const bootedService = new ClassifierService(bootedStore, mockDwClient);
+      bootedService.recoverAndResumeQueue();
+      await bootedService.waitForIdle();
+
+      const healedSummary = bootedService.getTrainingSummary();
+      assert.equal(healedSummary.model.status, 'active');
+      assert.equal(healedSummary.summary.activeCategories, 3);
+      assert.equal(healedSummary.summary.pendingCategories, 0);
+      assert.equal(healedSummary.summary.learnedExamples, 30);
+      assert.equal(healedSummary.summary.pendingExamples, 0);
+      assert.equal(healedSummary.trainingDiagnostics.activationApproved, true);
+    } finally {
+      fs.rmSync(healDir, { recursive: true, force: true });
+    }
   });
 });

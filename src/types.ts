@@ -281,6 +281,36 @@ export interface TrainStatusResponse {
   message: string;
 }
 
+export interface CategoryActivationDiagnostics {
+  eligible: boolean;
+  includedInLastCandidate: boolean | null;
+  lastAttemptStatus:
+    | 'approved'
+    | 'rejected'
+    | 'pending'
+    | 'not_evaluated'
+    | 'blocked_by_global_validation'
+    | 'not_eligible'
+    | 'waiting_second_category'
+    | null;
+  reasonCode:
+    | 'VALIDATED_AND_ACTIVE'
+    | 'CATEGORY_F1_BELOW_THRESHOLD'
+    | 'MACRO_F1_BELOW_THRESHOLD'
+    | 'MODEL_REGRESSION_PREVENTED'
+    | 'CANDIDATE_MODEL_REJECTED'
+    | 'INSUFFICIENT_PASSING_CATEGORIES'
+    | 'INSUFFICIENT_EXAMPLES'
+    | 'INSUFFICIENT_ELIGIBLE_CATEGORIES'
+    | 'PENDING_TRAINING_CYCLE'
+    | null;
+  reasonMessage: string | null;
+  candidatePrecision: number | null;
+  candidateRecall: number | null;
+  candidateF1: number | null;
+  requiredF1: number;
+}
+
 export interface TrainSummaryCategoryItem {
   documentType: string;
   status: CategoryStatus;
@@ -294,7 +324,40 @@ export interface TrainSummaryCategoryItem {
     recall: number;
     f1: number;
   } | null;
+  activation: CategoryActivationDiagnostics;
   lastExampleAt: string | null;
+}
+
+export interface TrainingAttemptDiagnostics {
+  lastAttemptAt: string | null;
+  candidateCategories: string[];
+  candidateExamples: number;
+  candidateValidation: {
+    accuracy: number;
+    macroF1: number;
+    weightedF1: number;
+    manualReviewRate: number;
+    perCategory: Record<
+      string,
+      {
+        documentType: string;
+        support: number;
+        precision: number;
+        recall: number;
+        f1: number;
+        passed: boolean;
+      }
+    >;
+    confusionMatrix: {
+      labels: string[];
+      categoryKeys?: string[];
+      matrix: number[][];
+    };
+  } | null;
+  activationApproved: boolean | null;
+  rejectionReasons: string[];
+  activeModelVersionBeforeAttempt: string | null;
+  activeModelVersionAfterAttempt: string | null;
 }
 
 export interface TrainSummaryResponse {
@@ -309,6 +372,11 @@ export interface TrainSummaryResponse {
       accuracy: number;
       macroF1: number;
       weightedF1: number;
+      confusionMatrix?: {
+        labels: string[];
+        categoryKeys?: string[];
+        matrix: number[][];
+      };
     } | null;
   };
   summary: {
@@ -325,6 +393,7 @@ export interface TrainSummaryResponse {
     failedJobs: number;
     rejectedJobs: number;
   };
+  trainingDiagnostics: TrainingAttemptDiagnostics;
   categories: TrainSummaryCategoryItem[];
 }
 
@@ -407,10 +476,12 @@ export interface CategoryMetricsReport {
 export interface ModelValidationReport {
   accuracy: number;
   macroF1: number;
+  weightedF1?: number;
   manualReviewRate: number;
   perCategory: Record<string, CategoryMetricsReport>;
   confusionMatrix: {
     labels: string[];
+    categoryKeys?: string[];
     matrix: number[][];
   };
   engine: 'python_sklearn' | 'node_tfidf_logreg';

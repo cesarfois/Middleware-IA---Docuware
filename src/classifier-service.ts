@@ -1,4 +1,8 @@
-import { ClassifierStore } from './classifier-store.js';
+import {
+  ClassifierStore,
+  type StoredExampleRecord,
+  type StoredModelRecord,
+} from './classifier-store.js';
 import { config } from './config.js';
 import {
   DocuWarePlatformClient,
@@ -13,6 +17,7 @@ import {
   type TrainingSampleInput,
 } from './ml-engine.js';
 import type {
+  CategoryActivationDiagnostics,
   ClassifyRequestBody,
   ClassifyResponse,
   NormalizedClassifyRequest,
@@ -25,6 +30,7 @@ import type {
   TrainStatusResponse,
   TrainSummaryCategoryItem,
   TrainSummaryResponse,
+  TrainingAttemptDiagnostics,
   TrainingJobStatus,
   TrainingOperationType,
 } from './types.js';
@@ -210,15 +216,80 @@ export class ClassifierService {
   }
 
   /**
-   * Recupera trabalhos interrompidos num reinício anterior e retoma o processamento da fila.
+   * Recupera trabalhos interrompidos num reinício anterior, retoma o processamento da fila
+   * e dispara reavaliação automática caso existam categorias elegíveis pendentes ou métricas legadas.
    */
   public recoverAndResumeQueue(): number {
     const recoveredCount = this.store.recoverInterruptedJobs();
     const pending = this.store.getPendingOrInterruptedJobs();
     if (pending.length > 0) {
       this.scheduleWorkerPump();
+    } else if (this.needsStartupModelEvaluation()) {
+      void this.evaluateAndTrainModelIfNeeded();
     }
     return recoveredCount;
+  }
+
+  private isModelReportLegacyOrInconsistent(
+    model: StoredModelRecord | null
+  ): boolean {
+    if (!model) return false;
+    const report = model.report;
+    if (typeof report.weightedF1 !== 'number') {
+      return true;
+    }
+    const supportSum = Object.values(report.perCategory ?? {}).reduce(
+      (acc, c) => acc + (c.support ?? 0),
+      0
+    );
+    const cmSum = (report.confusionMatrix?.matrix ?? []).reduce(
+      (acc, row) => acc + row.reduce((rAcc, val) => rAcc + val, 0),
+      0
+    );
+    return supportSum > 0 && cmSum !== supportSum;
+  }
+
+  private computeDatasetSignature(
+    examples: StoredExampleRecord[],
+    eligibleKeys: string[]
+  ): string {
+    const sortedKeys = [...eligibleKeys].sort().join(',');
+    const sortedEx = [...examples]
+      .sort((a, b) => a.id - b.id)
+      .map((ex) => `${ex.id}:${ex.categoryKey}:${ex.textHash}`)
+      .join('|');
+    return `${sortedKeys}::${sortedEx}`;
+  }
+
+  private needsStartupModelEvaluation(): boolean {
+    const minExamples = config.classifierMinExamplesPerCategory;
+    const minCats = config.classifierMinCategoriesForModel;
+    const eligibleCategories = this.store
+      .getAllCategories()
+      .filter((c) => c.examplesCount >= minExamples);
+
+    if (eligibleCategories.length < minCats) {
+      return false;
+    }
+
+    const eligibleKeys = eligibleCategories.map((c) => c.categoryKey);
+    const candidateExamples = this.store.getExamplesByCategories(eligibleKeys);
+    const activeModel = this.store.getActiveModel();
+    const lastDiag = this.store.getTrainingDiagnostics();
+    const currentSig = this.computeDatasetSignature(
+      candidateExamples,
+      eligibleKeys
+    );
+
+    if (this.isModelReportLegacyOrInconsistent(activeModel)) {
+      return true;
+    }
+
+    if (!lastDiag || lastDiag.datasetSignature !== currentSig) {
+      return true;
+    }
+
+    return false;
   }
 
   /**
@@ -342,8 +413,10 @@ export class ClassifierService {
     const allCategories = this.store.getAllCategories();
     const allExamples = this.store.getAllExamples();
     const allJobs = this.store.getAllJobs();
+    const storedDiag = this.store.getTrainingDiagnostics();
     const minExamples = config.classifierMinExamplesPerCategory;
     const minCats = config.classifierMinCategoriesForModel;
+    const minF1 = config.classifierMinValidationF1;
 
     const isModelActive = Boolean(
       activeModel && activeModel.categories.length >= minCats
@@ -353,6 +426,10 @@ export class ClassifierService {
       accuracy: number;
       macroF1: number;
       weightedF1: number;
+      confusionMatrix?: {
+        labels: string[];
+        matrix: number[][];
+      };
     } | null = null;
 
     if (isModelActive && activeModel) {
@@ -362,7 +439,9 @@ export class ClassifierService {
         0
       );
       const weightedF1 =
-        totalSupport > 0
+        typeof activeModel.report.weightedF1 === 'number'
+          ? activeModel.report.weightedF1
+          : totalSupport > 0
           ? Number(
               (
                 perCatList.reduce(
@@ -377,8 +456,18 @@ export class ClassifierService {
         accuracy: activeModel.report.accuracy,
         macroF1: activeModel.report.macroF1,
         weightedF1,
+        confusionMatrix: activeModel.report.confusionMatrix
+          ? {
+              labels: activeModel.report.confusionMatrix.labels,
+              matrix: activeModel.report.confusionMatrix.matrix,
+            }
+          : undefined,
       };
     }
+
+    const totalEligibleCount = allCategories.filter(
+      (c) => c.examplesCount >= minExamples
+    ).length;
 
     const categoriesList: TrainSummaryCategoryItem[] = allCategories
       .slice()
@@ -388,6 +477,7 @@ export class ClassifierService {
           (ex) => ex.categoryKey === cat.categoryKey
         );
         const examplesReceived = catExamples.length;
+        const isEligible = examplesReceived >= minExamples;
         const isCatActive = Boolean(
           isModelActive &&
             activeModel &&
@@ -419,6 +509,70 @@ export class ClassifierService {
           }
         }
 
+        const storedCatAct =
+          storedDiag?.perCategoryActivation?.[cat.categoryKey];
+        let activation: CategoryActivationDiagnostics;
+
+        if (!isEligible) {
+          activation = {
+            eligible: false,
+            includedInLastCandidate: false,
+            lastAttemptStatus: 'not_evaluated',
+            reasonCode: 'INSUFFICIENT_EXAMPLES',
+            reasonMessage: `A categoria possui ${examplesReceived}/${minExamples} exemplos válidos. São necessários pelo menos ${minExamples} exemplos para entrar na validação cruzada.`,
+            candidatePrecision: null,
+            candidateRecall: null,
+            candidateF1: null,
+            requiredF1: minF1,
+          };
+        } else if (totalEligibleCount < minCats) {
+          activation = {
+            eligible: true,
+            includedInLastCandidate: false,
+            lastAttemptStatus: 'not_evaluated',
+            reasonCode: 'INSUFFICIENT_ELIGIBLE_CATEGORIES',
+            reasonMessage: `A categoria atingiu ${examplesReceived}/${minExamples} exemplos, mas o treino discriminativo exige pelo menos ${minCats} categorias elegíveis (atualmente: ${totalEligibleCount}/${minCats}).`,
+            candidatePrecision: null,
+            candidateRecall: null,
+            candidateF1: null,
+            requiredF1: minF1,
+          };
+        } else if (isCatActive && activeModel) {
+          activation = {
+            eligible: true,
+            includedInLastCandidate:
+              storedCatAct?.includedInLastCandidate ?? true,
+            lastAttemptStatus: 'approved',
+            reasonCode: 'VALIDATED_AND_ACTIVE',
+            reasonMessage:
+              storedCatAct?.lastAttemptStatus === 'approved'
+                ? storedCatAct.reasonMessage
+                : `Categoria validada com sucesso (F1=${(catReport?.f1Score ?? activeModel.report.macroF1).toFixed(4)}) e ativa no modelo ${activeModel.version}.`,
+            candidatePrecision:
+              storedCatAct?.candidatePrecision ?? catReport?.precision ?? null,
+            candidateRecall:
+              storedCatAct?.candidateRecall ?? catReport?.recall ?? null,
+            candidateF1:
+              storedCatAct?.candidateF1 ?? catReport?.f1Score ?? null,
+            requiredF1: minF1,
+          };
+        } else if (storedCatAct) {
+          activation = storedCatAct;
+        } else {
+          activation = {
+            eligible: true,
+            includedInLastCandidate: false,
+            lastAttemptStatus: 'pending',
+            reasonCode: 'PENDING_TRAINING_CYCLE',
+            reasonMessage:
+              'Categoria elegível aguardando execução do ciclo de validação cruzada 5-Fold.',
+            candidatePrecision: null,
+            candidateRecall: null,
+            candidateF1: null,
+            requiredF1: minF1,
+          };
+        }
+
         return {
           documentType: cat.displayName,
           status: isCatActive ? 'active' : 'pending_validation',
@@ -434,6 +588,7 @@ export class ClassifierService {
                 f1: catReport.f1Score,
               }
             : null,
+          activation,
           lastExampleAt,
         };
       });
@@ -460,6 +615,74 @@ export class ClassifierService {
     ).length;
     const failedJobs = allJobs.filter((j) => j.status === 'failed').length;
     const rejectedJobs = allJobs.filter((j) => j.status === 'rejected').length;
+
+    let trainingDiagnostics: TrainingAttemptDiagnostics;
+    if (storedDiag?.diagnostics) {
+      trainingDiagnostics = storedDiag.diagnostics;
+    } else if (isModelActive && activeModel) {
+      const perCatDiag: Record<
+        string,
+        {
+          documentType: string;
+          precision: number;
+          recall: number;
+          f1: number;
+          support: number;
+          passed: boolean;
+        }
+      > = {};
+      for (const [catKey, metrics] of Object.entries(
+        activeModel.report.perCategory ?? {}
+      )) {
+        const display =
+          this.store.getCategory(catKey)?.displayName ?? catKey;
+        perCatDiag[display] = {
+          documentType: display,
+          precision: metrics.precision,
+          recall: metrics.recall,
+          f1: metrics.f1Score,
+          support: metrics.support,
+          passed: metrics.f1Score >= minF1,
+        };
+      }
+      trainingDiagnostics = {
+        lastAttemptAt:
+          activeModel.trainedAt ??
+          activeModel.artifact.trainedAt ??
+          activeModel.createdAt,
+        candidateCategories: activeModel.categories.map(
+          (k) => this.store.getCategory(k)?.displayName ?? k
+        ),
+        candidateExamples: learnedExamples,
+        candidateValidation: {
+          accuracy: activeModel.report.accuracy,
+          macroF1: activeModel.report.macroF1,
+          weightedF1: modelValidation?.weightedF1 ?? activeModel.report.macroF1,
+          manualReviewRate: activeModel.report.manualReviewRate ?? 0,
+          perCategory: perCatDiag,
+          confusionMatrix: {
+            labels: activeModel.report.confusionMatrix?.labels ?? [],
+            matrix: activeModel.report.confusionMatrix?.matrix ?? [],
+          },
+        },
+        activationApproved: true,
+        rejectionReasons: [],
+        activeModelVersionBeforeAttempt:
+          this.store.getPreviousModel()?.version ?? null,
+        activeModelVersionAfterAttempt: activeModel.version,
+      };
+    } else {
+      trainingDiagnostics = {
+        lastAttemptAt: null,
+        candidateCategories: [],
+        candidateExamples: 0,
+        candidateValidation: null,
+        activationApproved: false,
+        rejectionReasons: [],
+        activeModelVersionBeforeAttempt: null,
+        activeModelVersionAfterAttempt: null,
+      };
+    }
 
     return {
       success: true,
@@ -498,6 +721,7 @@ export class ClassifierService {
         failedJobs,
         rejectedJobs,
       },
+      trainingDiagnostics,
       categories: categoriesList,
     };
   }
@@ -1153,10 +1377,11 @@ export class ClassifierService {
   private async runModelTrainingCycle(): Promise<void> {
     const minExamples = config.classifierMinExamplesPerCategory;
     const minCats = config.classifierMinCategoriesForModel;
+    const minF1 = config.classifierMinValidationF1;
     const allCategories = this.store.getAllCategories();
-    const eligibleCategories = allCategories.filter(
-      (c) => c.examplesCount >= minExamples
-    );
+    const eligibleCategories = allCategories
+      .filter((c) => c.examplesCount >= minExamples)
+      .sort((a, b) => a.categoryKey.localeCompare(b.categoryKey));
 
     // Regra de validação discriminativa: exige pelo menos 2 categorias com >= 10 exemplos cada
     if (eligibleCategories.length < minCats) {
@@ -1165,8 +1390,13 @@ export class ClassifierService {
 
     const eligibleKeys = eligibleCategories.map((c) => c.categoryKey);
     const candidateExamples = this.store.getExamplesByCategories(eligibleKeys);
+    const datasetSignature = this.computeDatasetSignature(
+      candidateExamples,
+      eligibleKeys
+    );
 
     const activeModel = this.store.getActiveModel();
+    const lastDiag = this.store.getTrainingDiagnostics();
     const hasUnlearnedExamples = candidateExamples.some(
       (ex) => ex.status === 'stored'
     );
@@ -1174,10 +1404,28 @@ export class ClassifierService {
       !activeModel ||
       activeModel.categories.length !== eligibleKeys.length ||
       eligibleKeys.some((k) => !activeModel.categories.includes(k));
+    const isLegacyCorrupted = this.isModelReportLegacyOrInconsistent(activeModel);
 
-    if (!hasUnlearnedExamples && !activeCatsChanged) {
+    if (
+      !hasUnlearnedExamples &&
+      !activeCatsChanged &&
+      !isLegacyCorrupted &&
+      lastDiag !== null
+    ) {
       return;
     }
+
+    // Evita re-treinar repetidamente um conjunto de dados idêntico já avaliado quando o modelo ativo já é consistente
+    if (
+      !isLegacyCorrupted &&
+      lastDiag &&
+      lastDiag.datasetSignature === datasetSignature
+    ) {
+      return;
+    }
+
+    const attemptAt = new Date().toISOString();
+    const versionBefore = activeModel?.version ?? null;
 
     const samples: TrainingSampleInput[] = candidateExamples.map((ex) => ({
       id: ex.id,
@@ -1193,22 +1441,74 @@ export class ClassifierService {
       config.classifierMinMargin
     );
 
+    const candidatePerCategoryDiag: Record<
+      string,
+      {
+        documentType: string;
+        precision: number;
+        recall: number;
+        f1: number;
+        support: number;
+        passed: boolean;
+      }
+    > = {};
+
+    for (const cat of eligibleCategories) {
+      const m = trainingResult.report.perCategory[cat.categoryKey];
+      if (m) {
+        candidatePerCategoryDiag[cat.displayName] = {
+          documentType: cat.displayName,
+          precision: m.precision,
+          recall: m.recall,
+          f1: m.f1Score,
+          support: m.support,
+          passed: m.f1Score >= minF1,
+        };
+      }
+    }
+
+    const candidateWeightedF1 =
+      typeof trainingResult.report.weightedF1 === 'number'
+        ? trainingResult.report.weightedF1
+        : trainingResult.report.macroF1;
+
     // Verifica quais categorias passaram no critério de qualidade individual (F1 >= classifierMinValidationF1)
-    const minF1 = config.classifierMinValidationF1;
     const passingKeys = eligibleKeys.filter((catKey) => {
       const catReport = trainingResult.report.perCategory[catKey];
-      return catReport && catReport.f1Score >= minF1;
+      return Boolean(catReport && catReport.f1Score >= minF1);
     });
 
     const failingKeys = eligibleKeys.filter((k) => !passingKeys.includes(k));
+    const rejectionReasons: string[] = [];
+    const perCategoryActivation: Record<string, CategoryActivationDiagnostics> =
+      {};
 
-    // Se alguma categoria falhou na validação (ex.: 10 exemplos incoerentes/contraditórios)
+    // Caso 1: Alguma categoria elegível reprovou no F1 mínimo individual
     if (failingKeys.length > 0) {
       for (const failKey of failingKeys) {
         const failCat = this.store.getCategory(failKey);
+        const displayName = failCat?.displayName ?? failKey;
         const failMetrics = trainingResult.report.perCategory[failKey];
         const f1Val = failMetrics?.f1Score ?? 0;
-        const failMsg = `A categoria "${failCat?.displayName ?? failKey}" atingiu ${failCat?.examplesCount ?? 0} exemplos, mas reprovou na validação de coerência (F1=${(f1Val * 100).toFixed(1)}%, mínimo exigido=${(minF1 * 100).toFixed(1)}%). A categoria permanece em "pending_validation" até receber exemplos consistentes.`;
+        const precVal = failMetrics?.precision ?? 0;
+        const recVal = failMetrics?.recall ?? 0;
+
+        const reasonMessage = `A categoria "${displayName}" obteve F1 de ${f1Val.toFixed(4)} na validação cruzada 5-Fold, abaixo do mínimo exigido de ${minF1}.`;
+        rejectionReasons.push(reasonMessage);
+
+        perCategoryActivation[failKey] = {
+          eligible: true,
+          includedInLastCandidate: true,
+          lastAttemptStatus: 'rejected',
+          reasonCode: 'CATEGORY_F1_BELOW_THRESHOLD',
+          reasonMessage,
+          candidatePrecision: precVal,
+          candidateRecall: recVal,
+          candidateF1: f1Val,
+          requiredF1: minF1,
+        };
+
+        const failAuditMsg = `A categoria "${displayName}" atingiu ${failCat?.examplesCount ?? 0} exemplos, mas reprovou na validação de coerência (F1=${(f1Val * 100).toFixed(1)}%, mínimo exigido=${(minF1 * 100).toFixed(1)}%). A categoria permanece em "pending_validation" até receber exemplos consistentes.`;
 
         this.store.recordAuditEvent({
           trainingId: null,
@@ -1216,84 +1516,278 @@ export class ClassifierService {
           documentId: 0,
           eventType: 'validation_failed',
           errorCode: 'CATEGORY_VALIDATION_FAILED',
-          message: failMsg,
+          message: failAuditMsg,
           details: {
             categoryKey: failKey,
+            precision: precVal,
+            recall: recVal,
             f1Score: f1Val,
             minimumRequiredF1: minF1,
           },
         });
 
-        // Atualiza a mensagem dos jobs stored dessa categoria para informar que aguarda mais exemplos coerentes
         for (const job of this.store.getJobsByCategoryAndStatus(
           failKey,
           'stored'
         )) {
           this.store.updateTrainingJob(job.trainingId, {
-            statusMessage: failMsg,
+            statusMessage: failAuditMsg,
             completedAt: new Date().toISOString(),
           });
         }
       }
 
-      // Se restarem menos de 2 categorias aprovadas, não ativamos um modelo de classe única
-      if (passingKeys.length < minCats) {
-        return;
+      let versionAfter = versionBefore;
+
+      // Se existem pelo menos 2 categorias válidas que passaram, verificamos se já estão ativas e atualizadas
+      if (passingKeys.length >= minCats) {
+        const filteredSamples = samples.filter((s) =>
+          passingKeys.includes(s.categoryKey)
+        );
+        const passingExamples = candidateExamples.filter((ex) =>
+          passingKeys.includes(ex.categoryKey)
+        );
+        const passingHasUnlearned = passingExamples.some(
+          (ex) => ex.status === 'stored'
+        );
+        const activeAlreadyMatchesPassing =
+          Boolean(activeModel) &&
+          !isLegacyCorrupted &&
+          activeModel!.categories.length === passingKeys.length &&
+          passingKeys.every((k) => activeModel!.categories.includes(k)) &&
+          !passingHasUnlearned;
+
+        if (!activeAlreadyMatchesPassing) {
+          const retryResult = await executeModelTraining(
+            filteredSamples,
+            config.classifierMinConfidence,
+            config.classifierMinMargin
+          );
+
+          const allRetryPassed = passingKeys.every(
+            (k) => (retryResult.report.perCategory[k]?.f1Score ?? 0) >= minF1
+          );
+
+          if (retryResult.report.macroF1 >= minF1 && allRetryPassed) {
+            const activatedSubset = this.store.activateNewModelVersion({
+              categories: passingKeys,
+              report: retryResult.report,
+              artifact: retryResult.artifact,
+              incorporatedExampleIds: filteredSamples.map((s) => s.id),
+            });
+            versionAfter = activatedSubset.version;
+          }
+        }
       }
 
-      // Se existem pelo menos 2 categorias válidas que passaram, re-treinamos apenas com as categorias aprovadas
-      const filteredSamples = samples.filter((s) =>
-        passingKeys.includes(s.categoryKey)
-      );
-      const retryResult = await executeModelTraining(
-        filteredSamples,
-        config.classifierMinConfidence,
-        config.classifierMinMargin
-      );
-
-      if (retryResult.report.macroF1 < minF1) {
-        return;
+      const activeAfter = this.store.getActiveModel();
+      for (const passKey of passingKeys) {
+        const passMetrics = trainingResult.report.perCategory[passKey];
+        const isNowActive = Boolean(
+          activeAfter && activeAfter.categories.includes(passKey)
+        );
+        perCategoryActivation[passKey] = {
+          eligible: true,
+          includedInLastCandidate: true,
+          lastAttemptStatus: isNowActive ? 'approved' : 'rejected',
+          reasonCode: isNowActive
+            ? 'VALIDATED_AND_ACTIVE'
+            : 'CANDIDATE_MODEL_REJECTED',
+          reasonMessage: isNowActive
+            ? `Categoria aprovada na validação cruzada (F1=${(passMetrics?.f1Score ?? 0).toFixed(4)}) e ativa no modelo ${activeAfter!.version}.`
+            : `A categoria obteve F1=${(passMetrics?.f1Score ?? 0).toFixed(4)} (>= ${minF1}), mas aguarda pelo menos ${minCats} categorias aprovadas em conjunto para ativar o modelo.`,
+          candidatePrecision: passMetrics?.precision ?? null,
+          candidateRecall: passMetrics?.recall ?? null,
+          candidateF1: passMetrics?.f1Score ?? null,
+          requiredF1: minF1,
+        };
       }
 
-      this.store.activateNewModelVersion({
-        categories: passingKeys,
-        report: retryResult.report,
-        artifact: retryResult.artifact,
-        incorporatedExampleIds: filteredSamples.map((s) => s.id),
+      this.store.setTrainingDiagnostics({
+        datasetSignature,
+        diagnostics: {
+          lastAttemptAt: attemptAt,
+          candidateCategories: eligibleCategories.map((c) => c.displayName),
+          candidateExamples: samples.length,
+          candidateValidation: {
+            accuracy: trainingResult.report.accuracy,
+            macroF1: trainingResult.report.macroF1,
+            weightedF1: candidateWeightedF1,
+            manualReviewRate: trainingResult.report.manualReviewRate,
+            perCategory: candidatePerCategoryDiag,
+            confusionMatrix: {
+              labels: trainingResult.report.confusionMatrix.labels,
+              matrix: trainingResult.report.confusionMatrix.matrix,
+            },
+          },
+          activationApproved: false,
+          rejectionReasons,
+          activeModelVersionBeforeAttempt: versionBefore,
+          activeModelVersionAfterAttempt: versionAfter,
+        },
+        perCategoryActivation,
       });
       return;
     }
 
-    // Validação global de Macro-F1 e proteção contra regressão severa
+    // Caso 2: Validação global de Macro-F1 abaixo do limiar
     if (trainingResult.report.macroF1 < minF1) {
+      const macroMsg = `O modelo candidato obteve Macro-F1 global de ${trainingResult.report.macroF1.toFixed(4)}, abaixo do mínimo exigido de ${minF1}.`;
+      rejectionReasons.push(macroMsg);
+
+      for (const key of eligibleKeys) {
+        const m = trainingResult.report.perCategory[key];
+        perCategoryActivation[key] = {
+          eligible: true,
+          includedInLastCandidate: true,
+          lastAttemptStatus: 'rejected',
+          reasonCode: 'MACRO_F1_BELOW_THRESHOLD',
+          reasonMessage: macroMsg,
+          candidatePrecision: m?.precision ?? null,
+          candidateRecall: m?.recall ?? null,
+          candidateF1: m?.f1Score ?? null,
+          requiredF1: minF1,
+        };
+      }
+
+      this.store.setTrainingDiagnostics({
+        datasetSignature,
+        diagnostics: {
+          lastAttemptAt: attemptAt,
+          candidateCategories: eligibleCategories.map((c) => c.displayName),
+          candidateExamples: samples.length,
+          candidateValidation: {
+            accuracy: trainingResult.report.accuracy,
+            macroF1: trainingResult.report.macroF1,
+            weightedF1: candidateWeightedF1,
+            manualReviewRate: trainingResult.report.manualReviewRate,
+            perCategory: candidatePerCategoryDiag,
+            confusionMatrix: {
+              labels: trainingResult.report.confusionMatrix.labels,
+              matrix: trainingResult.report.confusionMatrix.matrix,
+            },
+          },
+          activationApproved: false,
+          rejectionReasons,
+          activeModelVersionBeforeAttempt: versionBefore,
+          activeModelVersionAfterAttempt: versionBefore,
+        },
+        perCategoryActivation,
+      });
       return;
     }
 
+    // Caso 3: Proteção contra regressão severa (aplicada apenas quando o candidato tem exatamente as mesmas categorias de um modelo ativo íntegro)
     if (
       activeModel &&
+      !isLegacyCorrupted &&
       activeModel.categories.length === eligibleKeys.length &&
       eligibleKeys.every((k) => activeModel.categories.includes(k))
     ) {
       const f1Drop =
         activeModel.report.macroF1 - trainingResult.report.macroF1;
       if (f1Drop > config.classifierMaxRegressionDrop) {
+        const regMsg = `Novo modelo rejeitado para evitar regressão (Macro-F1 caiu de ${activeModel.report.macroF1.toFixed(4)} para ${trainingResult.report.macroF1.toFixed(4)}). Versão ${activeModel.version} mantida ativa.`;
+        rejectionReasons.push(regMsg);
+
         this.store.recordAuditEvent({
           trainingId: null,
           fileCabinetId: 'SYSTEM',
           documentId: 0,
           eventType: 'validation_failed',
           errorCode: 'MODEL_REGRESSION_PREVENTED',
-          message: `Novo modelo rejeitado para evitar regressão (Macro-F1 caiu de ${activeModel.report.macroF1} para ${trainingResult.report.macroF1}). Versão ${activeModel.version} mantida ativa.`,
+          message: regMsg,
+        });
+
+        for (const key of eligibleKeys) {
+          const m = trainingResult.report.perCategory[key];
+          perCategoryActivation[key] = {
+            eligible: true,
+            includedInLastCandidate: true,
+            lastAttemptStatus: 'rejected',
+            reasonCode: 'MODEL_REGRESSION_PREVENTED',
+            reasonMessage: regMsg,
+            candidatePrecision: m?.precision ?? null,
+            candidateRecall: m?.recall ?? null,
+            candidateF1: m?.f1Score ?? null,
+            requiredF1: minF1,
+          };
+        }
+
+        this.store.setTrainingDiagnostics({
+          datasetSignature,
+          diagnostics: {
+            lastAttemptAt: attemptAt,
+            candidateCategories: eligibleCategories.map((c) => c.displayName),
+            candidateExamples: samples.length,
+            candidateValidation: {
+              accuracy: trainingResult.report.accuracy,
+              macroF1: trainingResult.report.macroF1,
+              weightedF1: candidateWeightedF1,
+              manualReviewRate: trainingResult.report.manualReviewRate,
+              perCategory: candidatePerCategoryDiag,
+              confusionMatrix: {
+                labels: trainingResult.report.confusionMatrix.labels,
+                matrix: trainingResult.report.confusionMatrix.matrix,
+              },
+            },
+            activationApproved: false,
+            rejectionReasons,
+            activeModelVersionBeforeAttempt: versionBefore,
+            activeModelVersionAfterAttempt: versionBefore,
+          },
+          perCategoryActivation,
         });
         return;
       }
     }
 
+    // Caso 4: Candidato aprovado integralmente -> ativa nova versão com todas as categorias elegíveis
     const activated = this.store.activateNewModelVersion({
       categories: eligibleKeys,
       report: trainingResult.report,
       artifact: trainingResult.artifact,
       incorporatedExampleIds: samples.map((s) => s.id),
+    });
+
+    for (const key of eligibleKeys) {
+      const m = trainingResult.report.perCategory[key];
+      perCategoryActivation[key] = {
+        eligible: true,
+        includedInLastCandidate: true,
+        lastAttemptStatus: 'approved',
+        reasonCode: 'VALIDATED_AND_ACTIVE',
+        reasonMessage: `Categoria validada com sucesso na validação cruzada 5-Fold (F1=${(m?.f1Score ?? trainingResult.report.macroF1).toFixed(4)} >= ${minF1}) e incorporada no modelo ativo ${activated.version}.`,
+        candidatePrecision: m?.precision ?? null,
+        candidateRecall: m?.recall ?? null,
+        candidateF1: m?.f1Score ?? null,
+        requiredF1: minF1,
+      };
+    }
+
+    this.store.setTrainingDiagnostics({
+      datasetSignature,
+      diagnostics: {
+        lastAttemptAt: attemptAt,
+        candidateCategories: eligibleCategories.map((c) => c.displayName),
+        candidateExamples: samples.length,
+        candidateValidation: {
+          accuracy: trainingResult.report.accuracy,
+          macroF1: trainingResult.report.macroF1,
+          weightedF1: candidateWeightedF1,
+          manualReviewRate: trainingResult.report.manualReviewRate,
+          perCategory: candidatePerCategoryDiag,
+          confusionMatrix: {
+            labels: trainingResult.report.confusionMatrix.labels,
+            matrix: trainingResult.report.confusionMatrix.matrix,
+          },
+        },
+        activationApproved: true,
+        rejectionReasons: [],
+        activeModelVersionBeforeAttempt: versionBefore,
+        activeModelVersionAfterAttempt: activated.version,
+      },
+      perCategoryActivation,
     });
 
     this.store.recordAuditEvent({
@@ -1308,6 +1802,7 @@ export class ClassifierService {
         categories: eligibleKeys,
         accuracy: activated.report.accuracy,
         macroF1: activated.report.macroF1,
+        weightedF1: candidateWeightedF1,
         engine: activated.report.engine,
       },
     });

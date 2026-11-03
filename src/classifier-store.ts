@@ -3,8 +3,10 @@ import path from 'node:path';
 import { config } from './config.js';
 import type { TrainedModelArtifact } from './ml-engine.js';
 import type {
+  CategoryActivationDiagnostics,
   CategoryStatus,
   ModelValidationReport,
+  TrainingAttemptDiagnostics,
   TrainingJobStatus,
   TrainingOperationType,
 } from './types.js';
@@ -90,6 +92,12 @@ export interface StoredAuditEventRecord {
   createdAt: string;
 }
 
+export interface StoredTrainingDiagnostics {
+  datasetSignature: string;
+  diagnostics: TrainingAttemptDiagnostics;
+  perCategoryActivation: Record<string, CategoryActivationDiagnostics>;
+}
+
 interface PersistedDatabaseSchema {
   counters: {
     jobSeq: number;
@@ -102,6 +110,7 @@ interface PersistedDatabaseSchema {
   jobs: Record<string, StoredTrainingJobRecord>;
   models: StoredModelRecord[];
   auditHistory: StoredAuditEventRecord[];
+  lastTrainingDiagnostics?: StoredTrainingDiagnostics | null;
 }
 
 /**
@@ -140,6 +149,7 @@ export class ClassifierStore {
       jobs: {},
       models: [],
       auditHistory: [],
+      lastTrainingDiagnostics: null,
     };
   }
 
@@ -163,6 +173,7 @@ export class ClassifierStore {
             auditHistory: Array.isArray(parsed.auditHistory)
               ? parsed.auditHistory
               : [],
+            lastTrainingDiagnostics: parsed.lastTrainingDiagnostics ?? null,
           };
         }
       }
@@ -592,21 +603,26 @@ export class ClassifierStore {
       if (idSet.has(ex.id) && activeCatSet.has(ex.categoryKey)) {
         ex.status = 'learned';
         ex.includedInModelVersion = version;
-        ex.updatedAt = now;
         incorporatedDocKeys.add(
           `${ex.fileCabinetId}::${ex.documentId}::${ex.categoryKey}`
         );
+      } else if (!activeCatSet.has(ex.categoryKey)) {
+        ex.status = 'stored';
+        ex.includedInModelVersion = null;
       }
     }
 
-    // Atualiza o estado das categorias incluídas no modelo
-    for (const catKey of params.categories) {
-      const cat = this.state.categories[catKey];
-      if (cat) {
+    // Atualiza o estado de todas as categorias conforme a sua inclusão no modelo ativo
+    for (const [catKey, cat] of Object.entries(this.state.categories)) {
+      if (activeCatSet.has(catKey)) {
         cat.status = 'active';
         cat.activeModelVersion = version;
         cat.lastValidationF1 =
           params.report.perCategory[catKey]?.f1Score ?? params.report.macroF1;
+        cat.updatedAt = now;
+      } else {
+        cat.status = 'pending_validation';
+        cat.activeModelVersion = null;
         cat.updatedAt = now;
       }
     }
@@ -665,5 +681,14 @@ export class ClassifierStore {
 
   public getAuditHistory(): StoredAuditEventRecord[] {
     return [...this.state.auditHistory];
+  }
+
+  public getTrainingDiagnostics(): StoredTrainingDiagnostics | null {
+    return this.state.lastTrainingDiagnostics ?? null;
+  }
+
+  public setTrainingDiagnostics(record: StoredTrainingDiagnostics): void {
+    this.state.lastTrainingDiagnostics = record;
+    this.flush();
   }
 }
